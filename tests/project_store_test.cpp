@@ -197,7 +197,10 @@ void execute_database_sql(
       .request_fingerprint = "fingerprint-" + token,
       .expected_revision = expected_revision,
       .mutation = mutation,
-      .exposure_delta_ev = exposure_delta_ev};
+      .exposure_delta_ev = exposure_delta_ev,
+      .edit_graph_json = {},
+      .edit_graph_sha256 = {},
+      .working_color_id = {}};
 }
 
 template <typename Action>
@@ -618,6 +621,7 @@ TEST_CASE("explicit v1 to v2 migration preserves history and idempotency") {
       .request_fingerprint = "fingerprint-replace-graph",
       .expected_revision = 4,
       .mutation = StoreMutation::replace_graph,
+      .exposure_delta_ev = 0.0,
       .edit_graph_json = replacement_source.edit_graph_json,
       .edit_graph_sha256 = replacement_source.edit_graph_sha256,
       .working_color_id = replacement_source.working_color_id};
@@ -655,6 +659,7 @@ TEST_CASE("v1 graph replacement requires explicit migration") {
       .request_fingerprint = "fingerprint-v1-replace",
       .expected_revision = 0,
       .mutation = StoreMutation::replace_graph,
+      .exposure_delta_ev = 0.0,
       .edit_graph_json = "{}",
       .edit_graph_sha256 = std::string(64U, '0'),
       .working_color_id =

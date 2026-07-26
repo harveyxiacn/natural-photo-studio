@@ -2,12 +2,12 @@
 
 #include "nps/color/color_encoding.hpp"
 #include "nps/imaging/image_f32.hpp"
+#include "nps/render/cancellation.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <span>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <string_view>
 
@@ -117,7 +117,7 @@ void export_atomic_ppm16(
     std::span<const std::filesystem::path> forbidden_paths,
     ExistingFilePolicy existing_file_policy =
         ExistingFilePolicy::refuse_existing,
-    std::stop_token stop_token = {},
+    CancellationToken cancellation = {},
     AtomicPpmExportFaultPoint fault_point =
         AtomicPpmExportFaultPoint::none);
 

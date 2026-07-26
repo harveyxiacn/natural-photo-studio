@@ -42,7 +42,10 @@ CommandExecutionResult CommandBus::execute(
       .expected_revision =
           static_cast<std::int64_t>(command.expected_revision),
       .mutation = StoreMutation::adjust_exposure,
-      .exposure_delta_ev = 0.0};
+      .exposure_delta_ev = 0.0,
+      .edit_graph_json = {},
+      .edit_graph_sha256 = {},
+      .working_color_id = {}};
 
   switch (command.kind) {
     case CommandKind::AdjustExposure:

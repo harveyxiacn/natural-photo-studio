@@ -14,7 +14,6 @@
 #include <iterator>
 #include <span>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -25,6 +24,8 @@ using nps::color::ColorEncoding;
 using nps::render::AtomicPpmExportIdentity;
 using nps::render::AtomicPpmExportError;
 using nps::render::AtomicPpmExportErrorCode;
+using nps::render::CancellationSource;
+using nps::render::CancellationToken;
 using nps::render::ExistingFilePolicy;
 
 constexpr auto linear_srgb =
@@ -101,7 +102,7 @@ void export_for_test(
     const ExistingFilePolicy policy =
         ExistingFilePolicy::refuse_existing,
     const std::span<const std::filesystem::path> forbidden_paths = {},
-    const std::stop_token stop_token = {},
+    const CancellationToken cancellation = {},
     const nps::render::AtomicPpmExportFaultPoint fault_point =
         nps::render::AtomicPpmExportFaultPoint::none) {
   TemporaryDirectory fallback_protected_scope;
@@ -116,7 +117,7 @@ void export_for_test(
           ? std::span<const std::filesystem::path>{fallback_forbidden}
           : forbidden_paths,
       policy,
-      stop_token,
+      cancellation,
       fault_point);
 }
 
@@ -738,7 +739,7 @@ TEST_CASE("atomic PPM export cancellation leaves target untouched") {
   const auto destination = temporary.path() / "cancelled.ppm";
   write_text(destination, "old target");
   const auto original = read_bytes(destination);
-  std::stop_source cancellation;
+  CancellationSource cancellation;
   cancellation.request_stop();
 
   const auto error = capture_error([&] {

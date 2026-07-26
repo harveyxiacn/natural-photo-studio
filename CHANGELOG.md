@@ -21,6 +21,14 @@ All notable changes will be documented here. The project follows semantic versio
 - Verified atomic 16-bit P6 reference export tied to authoritative v2 snapshot
   identity, with process-level crash and retry coverage.
 
+### Fixed
+
+- Replaced the renderer/export dependency on incomplete standard-library
+  `std::stop_token` implementations with a project-owned shared atomic
+  cancellation primitive, preserving C++20 portability on Apple Silicon.
+- Completed aggregate initialization for all persisted command fields so GCC
+  warning-as-error builds reject no valid M1 source or test target.
+
 ### Security
 
 - Export destinations are checked against mandatory project safety scopes,

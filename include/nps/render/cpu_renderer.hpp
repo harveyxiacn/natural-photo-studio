@@ -3,13 +3,13 @@
 #include "nps/document/edit_graph.hpp"
 #include "nps/imaging/image_f32.hpp"
 #include "nps/imaging/mask16.hpp"
+#include "nps/render/cancellation.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <string_view>
 
@@ -167,7 +167,7 @@ class CpuRenderer final {
       const document::EditGraph& graph,
       std::span<const MaskAssetView> masks,
       const RenderRequest& request,
-      std::stop_token stop_token = {}) const;
+      CancellationToken cancellation = {}) const;
 
  private:
   std::shared_ptr<CpuTileCache> cache_;

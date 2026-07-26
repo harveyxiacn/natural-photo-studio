@@ -15,10 +15,10 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -40,6 +40,8 @@ using nps::document::RgbCurveParameters;
 using nps::document::SourceParameters;
 using nps::imaging::ImageF32;
 using nps::imaging::Mask16;
+using nps::render::CancellationSource;
+using nps::render::CancellationToken;
 using nps::render::CpuRenderer;
 using nps::render::CpuTileCache;
 using nps::render::ImageRect;
@@ -55,6 +57,32 @@ using nps::render::RenderPublicationGate;
 constexpr auto linear_rec2020 =
     ColorEncoding::scene_linear_rec2020_d65;
 constexpr auto linear_srgb = ColorEncoding::scene_linear_srgb_d65;
+
+class JoiningThreadGroup final {
+ public:
+  explicit JoiningThreadGroup(const std::size_t capacity) {
+    threads_.reserve(capacity);
+  }
+
+  ~JoiningThreadGroup() {
+    for (auto& thread : threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  }
+
+  JoiningThreadGroup(const JoiningThreadGroup&) = delete;
+  JoiningThreadGroup& operator=(const JoiningThreadGroup&) = delete;
+
+  template <typename Callable>
+  void start(Callable&& callable) {
+    threads_.emplace_back(std::forward<Callable>(callable));
+  }
+
+ private:
+  std::vector<std::thread> threads_;
+};
 
 [[nodiscard]] std::string fake_sha256(const char digit = 'a') {
   return std::string(64U, digit);
@@ -245,13 +273,13 @@ constexpr auto linear_srgb = ColorEncoding::scene_linear_srgb_d65;
     const ImageF32& source,
     const EditGraph& graph,
     const RenderRequest& request,
-    const std::stop_token stop_token = {}) {
+    const CancellationToken cancellation = {}) {
   return CpuRenderer{}.render(
       source,
       graph,
       std::span<const MaskAssetView>{},
       request,
-      stop_token);
+      cancellation);
 }
 
 [[nodiscard]] RenderResult render_with_mask(
@@ -1089,13 +1117,30 @@ TEST_CASE("CpuRenderer rejects a graph and source color-space mismatch") {
       RenderErrorCode::unsupported_graph);
 }
 
+TEST_CASE("CancellationSource shares one monotonic cancellation state") {
+  const CancellationToken empty_token;
+  CHECK_FALSE(empty_token.stop_requested());
+
+  CancellationSource source;
+  CancellationSource source_copy = source;
+  const CancellationToken token = source.get_token();
+  const CancellationToken token_copy = token;
+  CHECK_FALSE(token.stop_requested());
+  CHECK_FALSE(token_copy.stop_requested());
+
+  REQUIRE(source_copy.request_stop());
+  CHECK_FALSE(source.request_stop());
+  CHECK(token.stop_requested());
+  CHECK(token_copy.stop_requested());
+}
+
 TEST_CASE("CpuRenderer observes cancellation before and during work") {
   const ImageF32 source = make_opaque_image(64U, 64U);
   const EditGraph simple_graph =
       make_graph({exposure_node("exposure", 1.0)});
   const RenderRequest request = request_for(source, 64U, 1U);
 
-  std::stop_source pre_cancelled;
+  CancellationSource pre_cancelled;
   REQUIRE(pre_cancelled.request_stop());
   require_render_error(
       [&] {
@@ -1120,34 +1165,36 @@ TEST_CASE("CpuRenderer observes cancellation before and during work") {
   auto cancellation_cache =
       std::make_shared<CpuTileCache>(4U * 1024U * 1024U);
   const CpuRenderer cached_renderer{cancellation_cache};
-  std::stop_source in_flight_stop;
+  CancellationSource in_flight_stop;
   std::atomic_bool call_entered{false};
   bool caught_cancelled = false;
   RenderErrorCode observed_code = RenderErrorCode::invalid_request;
   std::exception_ptr unexpected_failure;
-  std::jthread render_thread([&] {
-    call_entered.store(true, std::memory_order_release);
-    try {
-      static_cast<void>(cached_renderer.render(
-          source,
-          long_graph,
-          std::span<const MaskAssetView>{},
-          request,
-          in_flight_stop.get_token()));
-    } catch (const RenderError& error) {
-      caught_cancelled = true;
-      observed_code = error.code();
-    } catch (...) {
-      unexpected_failure = std::current_exception();
-    }
-  });
+  {
+    JoiningThreadGroup render_threads(1U);
+    render_threads.start([&] {
+      call_entered.store(true, std::memory_order_release);
+      try {
+        static_cast<void>(cached_renderer.render(
+            source,
+            long_graph,
+            std::span<const MaskAssetView>{},
+            request,
+            in_flight_stop.get_token()));
+      } catch (const RenderError& error) {
+        caught_cancelled = true;
+        observed_code = error.code();
+      } catch (...) {
+        unexpected_failure = std::current_exception();
+      }
+    });
 
-  while (!call_entered.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
+    while (!call_entered.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE(in_flight_stop.request_stop());
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  REQUIRE(in_flight_stop.request_stop());
-  render_thread.join();
 
   REQUIRE(unexpected_failure == nullptr);
   REQUIRE(caught_cancelled);
@@ -1501,32 +1548,47 @@ TEST_CASE(
     std::atomic_uint32_t ready{};
     std::atomic_bool start{};
     std::atomic_uint32_t accepted{};
-    std::jthread late_thread([&] {
-      RenderResult candidate = late;
-      ready.fetch_add(1U, std::memory_order_release);
-      while (!start.load(std::memory_order_acquire)) {
+    std::mutex failure_mutex;
+    std::exception_ptr unexpected_failure;
+    const auto publish = [&](const RenderResult& result) {
+      bool ready_announced = false;
+      try {
+        RenderResult candidate = result;
+        ready.fetch_add(1U, std::memory_order_release);
+        ready_announced = true;
+        while (!start.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        if (gate.try_publish(std::move(candidate))) {
+          accepted.fetch_add(1U, std::memory_order_relaxed);
+        }
+      } catch (...) {
+        std::scoped_lock lock(failure_mutex);
+        if (unexpected_failure == nullptr) {
+          unexpected_failure = std::current_exception();
+        }
+        if (!ready_announced) {
+          ready.fetch_add(1U, std::memory_order_release);
+        }
+      }
+    };
+    {
+      JoiningThreadGroup publish_threads(2U);
+      try {
+        publish_threads.start([&] { publish(late); });
+        publish_threads.start([&] { publish(current); });
+      } catch (...) {
+        start.store(true, std::memory_order_release);
+        throw;
+      }
+      while (ready.load(std::memory_order_acquire) != 2U) {
         std::this_thread::yield();
       }
-      if (gate.try_publish(std::move(candidate))) {
-        accepted.fetch_add(1U, std::memory_order_relaxed);
-      }
-    });
-    std::jthread current_thread([&] {
-      RenderResult candidate = current;
-      ready.fetch_add(1U, std::memory_order_release);
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-      if (gate.try_publish(std::move(candidate))) {
-        accepted.fetch_add(1U, std::memory_order_relaxed);
-      }
-    });
-    while (ready.load(std::memory_order_acquire) != 2U) {
-      std::this_thread::yield();
+      start.store(true, std::memory_order_release);
     }
-    start.store(true, std::memory_order_release);
-    late_thread.join();
-    current_thread.join();
+    if (unexpected_failure != nullptr) {
+      std::rethrow_exception(unexpected_failure);
+    }
 
     CHECK(accepted.load(std::memory_order_relaxed) == 1U);
     const auto published = gate.current();

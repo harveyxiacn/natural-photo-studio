@@ -29,6 +29,35 @@ constexpr std::uint32_t kMaximumWorkers = 64;
 constexpr std::size_t kSha256Bytes = 32U;
 constexpr std::size_t kCacheEntryAccountingOverhead = 128U;
 
+// Owns every started worker and joins them on both normal exit and stack
+// unwinding. Reserving before any start also prevents vector growth from
+// becoming an exception point after threads exist.
+class JoiningThreadGroup final {
+ public:
+  explicit JoiningThreadGroup(const std::size_t capacity) {
+    threads_.reserve(capacity);
+  }
+
+  ~JoiningThreadGroup() {
+    for (auto& thread : threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  }
+
+  JoiningThreadGroup(const JoiningThreadGroup&) = delete;
+  JoiningThreadGroup& operator=(const JoiningThreadGroup&) = delete;
+
+  template <typename Callable>
+  void start(Callable&& callable) {
+    threads_.emplace_back(std::forward<Callable>(callable));
+  }
+
+ private:
+  std::vector<std::thread> threads_;
+};
+
 [[noreturn]] void throw_render_error(
     const RenderErrorCode code,
     std::string message) {
@@ -414,7 +443,7 @@ void apply_node(
     const std::uint32_t source_x,
     const std::uint32_t source_y,
     const ExecutableNode& executable,
-    const std::stop_token stop_token) {
+    const CancellationToken cancellation) {
   const document::EditNode& node = *executable.node;
   if (!node.enabled || node.opacity == 0.0) {
     return;
@@ -432,7 +461,7 @@ void apply_node(
   }
 
   for (std::uint32_t y = 0; y < tile_height; ++y) {
-    if (stop_token.stop_requested()) {
+    if (cancellation.stop_requested()) {
       throw_render_error(
           RenderErrorCode::cancelled,
           "The render was cancelled before completion.");
@@ -547,7 +576,7 @@ struct TileGrid final {
     const imaging::ImageF32& source,
     const Tile tile,
     const std::vector<ExecutableNode>& executable,
-    const std::stop_token stop_token) {
+    const CancellationToken cancellation) {
   const std::size_t sample_count = checked_multiply(
       checked_multiply(
           static_cast<std::size_t>(tile.width),
@@ -580,7 +609,7 @@ struct TileGrid final {
         tile.x,
         tile.y,
         node,
-        stop_token);
+        cancellation);
   }
 
   return tile_samples;
@@ -930,8 +959,8 @@ RenderResult CpuRenderer::render(
     const document::EditGraph& graph,
     const std::span<const MaskAssetView> masks,
     const RenderRequest& request,
-    const std::stop_token stop_token) const {
-  if (stop_token.stop_requested()) {
+    const CancellationToken cancellation) const {
+  if (cancellation.stop_requested()) {
     throw_render_error(
         RenderErrorCode::cancelled,
         "The render was cancelled before it started.");
@@ -983,7 +1012,7 @@ RenderResult CpuRenderer::render(
 
   const auto worker = [&]() {
     while (!failed.load(std::memory_order_relaxed) &&
-           !stop_token.stop_requested()) {
+           !cancellation.stop_requested()) {
       const std::size_t tile_index =
           next_tile.fetch_add(1U, std::memory_order_relaxed);
       if (tile_index >= tile_grid.tile_count) {
@@ -1012,7 +1041,7 @@ RenderResult CpuRenderer::render(
         }
         if (!tile_samples.has_value()) {
           tile_samples = render_tile_samples(
-              source, tile, prepared.executable, stop_token);
+              source, tile, prepared.executable, cancellation);
           rendered_tiles.fetch_add(1U, std::memory_order_relaxed);
         }
         copy_tile_to_output(
@@ -1029,16 +1058,15 @@ RenderResult CpuRenderer::render(
   };
 
   {
-    std::vector<std::jthread> workers;
-    workers.reserve(actual_workers);
+    JoiningThreadGroup workers(actual_workers);
     for (std::uint32_t index = 0; index < actual_workers; ++index) {
-      workers.emplace_back(worker);
+      workers.start(worker);
     }
   }
   if (failure != nullptr) {
     std::rethrow_exception(failure);
   }
-  if (stop_token.stop_requested()) {
+  if (cancellation.stop_requested()) {
     throw_render_error(
         RenderErrorCode::cancelled,
         "The render was cancelled before completion.");

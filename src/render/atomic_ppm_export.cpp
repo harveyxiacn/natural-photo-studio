@@ -46,8 +46,8 @@ namespace {
   throw AtomicPpmExportError{code, message};
 }
 
-void check_cancelled(const std::stop_token stop_token) {
-  if (stop_token.stop_requested()) {
+void check_cancelled(const CancellationToken cancellation) {
+  if (cancellation.stop_requested()) {
     fail(
         AtomicPpmExportErrorCode::cancelled,
         "PPM export was cancelled");
@@ -639,13 +639,13 @@ class OwnedTemporaryFile final {
 
   void write_all(
       const std::span<const std::byte> bytes,
-      const std::stop_token stop_token,
+      const CancellationToken cancellation,
       const AtomicPpmExportFaultPoint fault_point) {
     constexpr std::size_t maximum_chunk = 64U * 1024U;
     std::size_t written{};
     bool first_write_completed = false;
     while (written < bytes.size()) {
-      check_cancelled(stop_token);
+      check_cancelled(cancellation);
       const auto chunk_size =
           std::min(maximum_chunk, bytes.size() - written);
 #ifdef _WIN32
@@ -693,7 +693,7 @@ class OwnedTemporaryFile final {
         }
       }
     }
-    check_cancelled(stop_token);
+    check_cancelled(cancellation);
   }
 
   void flush_and_close() {
@@ -987,11 +987,11 @@ void export_atomic_ppm16(
     const color::OpaqueImage16Options& opaque_options,
     const std::span<const std::filesystem::path> forbidden_paths,
     const ExistingFilePolicy existing_file_policy,
-    const std::stop_token stop_token,
+    const CancellationToken cancellation,
     const AtomicPpmExportFaultPoint fault_point) {
   validate_raw_path_inputs(destination, forbidden_paths);
   validate_identity(identity, image);
-  check_cancelled(stop_token);
+  check_cancelled(cancellation);
   switch (fault_point) {
     case AtomicPpmExportFaultPoint::none:
     case AtomicPpmExportFaultPoint::after_first_write:
@@ -1021,17 +1021,17 @@ void export_atomic_ppm16(
         AtomicPpmExportErrorCode::invalid_input,
         "the image or opaque conversion options are invalid");
   }
-  check_cancelled(stop_token);
+  check_cancelled(cancellation);
 
   auto temporary =
       create_temporary_file(normalized_destination.parent_path());
-  temporary.write_all(encoded, stop_token, fault_point);
+  temporary.write_all(encoded, cancellation, fault_point);
   temporary.flush_and_close();
   if (fault_point ==
       AtomicPpmExportFaultPoint::hard_exit_after_flush) {
     std::_Exit(kAtomicPpmExportHardExitCode);
   }
-  check_cancelled(stop_token);
+  check_cancelled(cancellation);
 
   try {
     const auto decoded = imaging::read_ppm16_file(temporary.path());
@@ -1047,7 +1047,7 @@ void export_atomic_ppm16(
         AtomicPpmExportErrorCode::verification_failed,
         "the temporary export failed strict PPM verification");
   }
-  check_cancelled(stop_token);
+  check_cancelled(cancellation);
 
   // Recheck link/reparse and existing-target state immediately before the
   // native publication primitive. The primitive itself enforces no-replace
@@ -1067,7 +1067,7 @@ void export_atomic_ppm16(
   // The final cooperative cancellation gate is deliberately adjacent to the
   // native commit primitive. A request arriving after this point races with an
   // indivisible OS publication and therefore observes either complete file.
-  check_cancelled(stop_token);
+  check_cancelled(cancellation);
   if (existing_file_policy == ExistingFilePolicy::refuse_existing) {
     publish_no_replace(temporary, normalized_destination);
   } else {
