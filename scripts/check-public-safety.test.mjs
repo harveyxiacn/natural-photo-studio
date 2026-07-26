@@ -58,11 +58,15 @@ test("accepts normal source, pinned Actions, approved emails, and licensed fixtu
     ".github/workflows/ci.yml",
     [
       "name: CI",
+      "permissions:",
+      "  contents: read",
       "jobs:",
       "  test:",
       "    runs-on: ubuntu-latest",
       "    steps:",
       `      - uses: actions/checkout@${"a".repeat(40)} # pinned`,
+      "        with:",
+      "          persist-credentials: false",
       "      - uses: ./.github/actions/local",
       `      - { uses: example/action@${"b".repeat(40)} }`,
       "",
@@ -237,6 +241,8 @@ test("rejects GitHub Actions that use a mutable ref", async (t) => {
     root,
     ".github/workflows/ci.yml",
     [
+      "permissions:",
+      "  contents: read",
       "jobs:",
       "  test:",
       "    runs-on: ubuntu-latest",
@@ -256,6 +262,63 @@ test("rejects GitHub Actions that use a mutable ref", async (t) => {
     ).length,
     3,
   );
+});
+
+test("rejects unsafe public-repository workflow capabilities", async (t) => {
+  const root = await createSandbox(t);
+  const privilegedTrigger = ["pull_request", "_target:"].join("");
+  const inheritedSecrets = ["secrets:", " inherit"].join("");
+  await writeSandboxFile(
+    root,
+    ".github/workflows/unsafe.yml",
+    [
+      "on:",
+      `  ${privilegedTrigger}`,
+      "permissions: write-all",
+      "jobs:",
+      "  test:",
+      "    runs-on: [self-hosted, windows]",
+      `    ${inheritedSecrets}`,
+      "    container: example.invalid/tool:latest",
+      "    steps:",
+      `      - uses: actions/checkout@${"a".repeat(40)}`,
+      "",
+    ].join("\n"),
+  );
+
+  const result = await scanRepository(root);
+  for (const expectedRule of [
+    "workflow.privileged-pr-trigger",
+    "workflow.broad-permissions",
+    "workflow.inherited-secrets",
+    "workflow.self-hosted-runner",
+    "supply-chain.container-not-pinned",
+    "workflow.checkout-credentials-not-disabled",
+  ]) {
+    assert.ok(
+      ruleNames(result).includes(expectedRule),
+      `${expectedRule}: ${JSON.stringify(result.violations, null, 2)}`,
+    );
+  }
+});
+
+test("requires explicit top-level workflow permissions", async (t) => {
+  const root = await createSandbox(t);
+  await writeSandboxFile(
+    root,
+    ".github/workflows/no-permissions.yml",
+    [
+      "jobs:",
+      "  test:",
+      "    runs-on: ubuntu-24.04",
+      "    steps:",
+      "      - run: npm test",
+      "",
+    ].join("\n"),
+  );
+
+  const result = await scanRepository(root);
+  assert.ok(ruleNames(result).includes("workflow.permissions-missing"));
 });
 
 test("rejects files above the configured size limit", async (t) => {

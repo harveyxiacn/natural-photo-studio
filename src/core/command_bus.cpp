@@ -56,6 +56,17 @@ CommandExecutionResult CommandBus::execute(
     case CommandKind::HistoryRedo:
       store_command.mutation = StoreMutation::redo;
       break;
+    case CommandKind::GraphReplace: {
+      const auto& parameters =
+          std::get<GraphReplaceParameters>(command.parameters);
+      store_command.mutation = StoreMutation::replace_graph;
+      store_command.edit_graph_json =
+          document::canonical_edit_graph_json(parameters.graph);
+      store_command.edit_graph_sha256 = parameters.graph_hash;
+      store_command.working_color_id =
+          parameters.graph.working_color_space();
+      break;
+    }
   }
 
   try {

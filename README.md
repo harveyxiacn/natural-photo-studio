@@ -1,7 +1,7 @@
 # Natural Photo Studio（自然光影）
 
 > 工作名：Natural Photo Studio
-> 当前阶段：M0 可恢复非破坏编辑内核已通过本地验收，公共 CI 待首次推送
+> 当前阶段：M1 不可变编辑图与 CPU 参考渲染器已通过 Windows 本地门禁，公共 CI 待首次推送
 > 产品定位：专业级、非破坏性、AI 原生的桌面照片编辑器
 
 Natural Photo Studio 的目标不是做一个只能“套滤镜”的轻量工具，也不是把生成式模型包装成黑盒按钮。它要同时服务两种需求：
@@ -63,7 +63,10 @@ flowchart LR
 | [发布与运维](docs/15-release-operations.md) | 安装、更新、崩溃恢复、遥测和支持 |
 | [术语与开放问题](docs/16-glossary-open-questions.md) | 统一术语和需要在研发前确认的事项 |
 | [M0 实现与验收记录](docs/17-milestone-m0.md) | 当前可运行范围、本地验证证据与已知限制 |
+| [M1 范围与验收契约](docs/18-milestone-m1.md) | 不可变编辑 DAG、CPU 参考渲染、迁移与原子导出 |
 | [M0 项目格式规范](specs/project-format/nps.project.v1.md) | 内容寻址对象、SQLite 元数据、恢复与完整性语义 |
+| [M1 项目格式规范](specs/project-format/nps.project.v2.md) | 显式颜色契约、不可变编辑图和 v1→v2 迁移语义 |
+| [M1 编辑图 Schema](specs/edit-graph/nps.edit-graph.v1.schema.json) | 版本化节点、引用、参数和严格结构边界 |
 
 关键架构决定记录在 [docs/adr](docs/adr/) 中。
 
@@ -92,7 +95,14 @@ M0 已建立后续专业编辑能力所依赖的最小可信底座：
 - 默认拒绝网络与云推理的 M0 隐私策略；
 - 合成像素测试、崩溃故障注入、公开仓库隐私扫描和跨平台 CI 配置。
 
-这不是可供终端用户修图的桌面应用。M0 不包含 RAW/常见照片解码、GPU、色彩管理、图层 UI、AI 模型或自然语言执行；PPM 仅是确定性测试格式。产品能力仍以设计文档和路线图为准，后续里程碑逐项实现。
+M1 在此基础上增加了 FP32 预乘 RGBA、稳定颜色 ID、不可变编辑 DAG、曝光/曲线/
+Mask16、ROI 与固定 512×512 tile、可取消的确定性 CPU 参考渲染、完整身份缓存隔离、
+显式 `nps.project/v1 → v2` 迁移，以及绑定真实项目快照身份的原子 16 位 PPM 参考
+导出。M1 仍在等待公共仓库三平台 CI 与 CodeQL 形成远端完成证据。
+
+这不是可供终端用户修图的桌面应用。当前实现不包含 RAW/常见照片解码、GPU、完整
+色彩管理、图层 UI、AI 模型或自然语言执行；PPM 仅是确定性测试格式。产品能力仍以
+设计文档和路线图为准，后续里程碑逐项实现。
 
 正式桌面版面向 Windows 与 Apple Silicon macOS：Windows 提供
 `NaturalPhotoStudio.exe` 及签名安装包，macOS 提供签名并经 Apple 公证的
@@ -136,9 +146,32 @@ Windows 上若 vcpkg 无法处理非 ASCII 的源码路径，请使用仅含 ASC
 ```bash
 ./build/dev/nps-cli demo ./build/dev/demo.npsproj
 ./build/dev/nps-cli verify ./build/dev/demo.npsproj
+./build/dev/nps-cli migrate-v1-v2 \
+  ./build/dev/demo.npsproj ./build/dev/demo-v2.npsproj
+./build/dev/nps-cli verify ./build/dev/demo-v2.npsproj
+./build/dev/nps-cli export-demo \
+  ./build/dev/demo-v2.npsproj ./build/dev/demo-v2.ppm
 ```
 
 Windows 可执行文件名为 `nps-cli.exe`。演示项目和预览文件位于被忽略的构建目录，不应提交到版本库。
+
+## 公共仓库隐私与安全边界
+
+公开贡献只能使用代码生成数据，或放在 `tests/fixtures/public` 下且带有许可和来源
+sidecar 的公开夹具。不要提交或附加个人/客户照片、项目目录、数据库、模型权重、绝对
+用户路径、未脱敏日志、凭据或包含这些内容的压缩包。公开 issue 同样适用；安全漏洞请
+使用仓库的
+[Private vulnerability reporting](https://github.com/harveyxiacn/natural-photo-studio/security/advisories/new)。
+
+提交前至少运行 `npm ci --ignore-scripts --no-audit --no-fund` 和
+`npm run check:policy`。该门禁会检查 UTF-8/文档链接、公开文件类型与夹具来源、常见
+凭据和个人路径、GitHub Action 固定、工作流危险权限以及 npm/vcpkg/Node.js/Gitleaks
+版本一致性；远端 policy job 还会用经 SHA-256 校验的 Gitleaks 扫描当前工作树和可达
+Git 历史。
+
+扫描器只检查明确的仓库根，不会读取仓库上级目录，也不能把已经进入 Git 历史的私密
+内容“自动匿名化”。如果误提交了私密内容，应立即停止发布，在公开前清理完整历史；
+凭据还必须撤销并轮换，不能只在后续提交中删除文件。
 
 把 CLI 暂存到独立前缀并从该位置运行：
 
@@ -154,7 +187,7 @@ Windows 使用 `build\stage\bin\nps-cli.exe`。安装规则会把 vcpkg 提供�
 `nps-cli` 所需的 OpenSSL Crypto 与 SQLite 运行时 DLL 放在同一 `bin`
 目录；Linux/macOS 的当前默认 vcpkg triplet 静态链接这些依赖。许可与声明文件安装到
 `share/natural-photo-studio`。这个目录只是用于开发和 CI 的 CLI 暂存树，
-不是已签名的 Windows 安装器或 macOS `.app`，也不会由 M0 CI 上传发布；
+不是已签名的 Windows 安装器或 macOS `.app`，也不会由当前核心 CI 上传发布；
 Windows 的 Visual C++ Runtime 等系统运行时仍是前置条件。
 
 ## 不可妥协的产品原则

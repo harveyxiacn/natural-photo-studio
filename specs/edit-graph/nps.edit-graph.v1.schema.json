@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:natural-photo-studio:schema:nps.edit-graph:v1",
+  "title": "Natural Photo Studio M1 immutable edit graph",
+  "description": "Strict nps.edit-graph/v1 envelope. Unknown properties are rejected at every object boundary.",
+  "$comment": "The transport parser rejects inputs above 4 MiB or 64 structural nesting levels before DOM parsing. The C++ domain validator additionally enforces unique node IDs, exactly one declared source and output, complete references, acyclicity, source-to-output connectivity, supported algorithm versions, and strictly increasing full-domain curve x coordinates.",
+  "type": "object",
+  "required": [
+    "schema",
+    "graphId",
+    "workingColorSpace",
+    "sourceNodeId",
+    "outputNodeId",
+    "nodes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "nps.edit-graph/v1"
+    },
+    "graphId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "workingColorSpace": {
+      "const": "nps.color/scene-linear-rec2020-d65/v1"
+    },
+    "sourceNodeId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "outputNodeId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 4096,
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/sourceNode"
+          },
+          {
+            "$ref": "#/$defs/exposureNode"
+          },
+          {
+            "$ref": "#/$defs/rgbCurveNode"
+          },
+          {
+            "$ref": "#/$defs/outputNode"
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "maskBinding": {
+      "type": "object",
+      "required": [
+        "maskId",
+        "contentHash",
+        "inverted"
+      ],
+      "properties": {
+        "maskId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "contentHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "inverted": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "nodeBase": {
+      "type": "object",
+      "required": [
+        "nodeId",
+        "type",
+        "algorithmVersion",
+        "enabled",
+        "opacity",
+        "computeDomain",
+        "inputs",
+        "parameters"
+      ],
+      "properties": {
+        "nodeId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "type": {
+          "type": "string"
+        },
+        "algorithmVersion": {
+          "const": "1.0.0"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "opacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "computeDomain": {
+          "const": "scene-linear"
+        },
+        "inputs": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableId"
+          }
+        },
+        "parameters": {
+          "type": "object"
+        },
+        "mask": {
+          "$ref": "#/$defs/maskBinding"
+        }
+      }
+    },
+    "sourceNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/nodeBase"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "source"
+            },
+            "enabled": {
+              "const": true
+            },
+            "opacity": {
+              "const": 1
+            },
+            "inputs": {
+              "maxItems": 0
+            },
+            "parameters": {
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "not": {
+            "required": [
+              "mask"
+            ]
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "exposureNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/nodeBase"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "adjust.exposure"
+            },
+            "inputs": {
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "parameters": {
+              "type": "object",
+              "required": [
+                "ev"
+              ],
+              "properties": {
+                "ev": {
+                  "type": "number",
+                  "minimum": -10,
+                  "maximum": 10
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "rgbCurveNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/nodeBase"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "adjust.curve.rgb"
+            },
+            "inputs": {
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "parameters": {
+              "type": "object",
+              "required": [
+                "points"
+              ],
+              "properties": {
+                "points": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 256,
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "x",
+                      "y"
+                    ],
+                    "properties": {
+                      "x": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "y": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "outputNode": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/nodeBase"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "output"
+            },
+            "enabled": {
+              "const": true
+            },
+            "opacity": {
+              "const": 1
+            },
+            "inputs": {
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "parameters": {
+              "properties": {},
+              "additionalProperties": false
+            }
+          },
+          "not": {
+            "required": [
+              "mask"
+            ]
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

@@ -11,9 +11,7 @@ on:
     - cron: "23 4 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  security-events: write
+permissions: {}
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}
@@ -28,8 +26,11 @@ env:
 jobs:
   analyze:
     name: Analyze C/C++
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,6 +52,8 @@ jobs:
             https://github.com/microsoft/vcpkg.git .tools/vcpkg
           git -C .tools/vcpkg fetch --depth 1 origin "$VCPKG_COMMIT"
           git -C .tools/vcpkg checkout --detach "$VCPKG_COMMIT"
+          actual_commit="$(git -C .tools/vcpkg rev-parse --verify HEAD)"
+          test "$actual_commit" = "$VCPKG_COMMIT"
 
       - name: Bootstrap vcpkg
         shell: bash

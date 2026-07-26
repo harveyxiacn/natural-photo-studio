@@ -1,0 +1,20 @@
+title = "Natural Photo Studio public-repository secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated dependencies and build output are rejected if tracked"
+paths = [
+  '''^(?:\.tools|build|node_modules)/''',
+]
+
+[[allowlists]]
+description = "Synthetic v1 migration idempotency fixture, not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^tests/project_store_test\.cpp$''']
+regexes = [
+  '''^\s*\.idempotency_key\s*=\s*"idempotency-v1-replace",\s*$''',
+]

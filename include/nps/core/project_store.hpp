@@ -12,6 +12,7 @@ namespace nps::core {
 
 enum class StoreMutation {
   adjust_exposure,
+  replace_graph,
   undo,
   redo,
 };
@@ -20,6 +21,8 @@ enum class FaultPoint {
   none,
   after_object_persisted,
   after_database_committed,
+  after_migration_staged,
+  after_migration_published,
 };
 
 struct StoreCommand {
@@ -29,6 +32,9 @@ struct StoreCommand {
   std::int64_t expected_revision{};
   StoreMutation mutation{StoreMutation::adjust_exposure};
   double exposure_delta_ev{};
+  std::string edit_graph_json;
+  std::string edit_graph_sha256;
+  std::string working_color_id;
 };
 
 struct Snapshot {
@@ -36,6 +42,11 @@ struct Snapshot {
   std::int64_t created_revision{};
   std::string source_hash;
   double exposure_ev{};
+  // Empty for nps.project/v1. nps.project/v2 stores the complete canonical
+  // immutable graph and its explicit color contract on every snapshot.
+  std::string edit_graph_json;
+  std::string edit_graph_sha256;
+  std::string working_color_id;
 };
 
 struct CommitResult {
@@ -72,6 +83,15 @@ class ProjectStore final {
 
   static ProjectStore open(const std::filesystem::path& project_root);
 
+  // Explicitly creates a separate v2 project. The v1 source is opened
+  // read-only under its project lease and is never replaced. source_root and
+  // target_root must be distinct siblings so the completed staging directory
+  // can be published with one rename.
+  static ProjectStore migrate_v1_to_v2(
+      const std::filesystem::path& source_root,
+      const std::filesystem::path& target_root,
+      FaultPoint fault_point = FaultPoint::none);
+
   ProjectStore(ProjectStore&&) noexcept;
   ProjectStore& operator=(ProjectStore&&) noexcept;
   ProjectStore(const ProjectStore&) = delete;
@@ -79,6 +99,7 @@ class ProjectStore final {
   ~ProjectStore();
 
   [[nodiscard]] std::string document_id() const;
+  [[nodiscard]] std::string project_format() const;
   [[nodiscard]] std::int64_t current_revision() const;
   [[nodiscard]] Snapshot current_snapshot() const;
   [[nodiscard]] std::vector<std::uint8_t> read_source_bytes() const;

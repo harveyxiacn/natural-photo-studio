@@ -1,5 +1,7 @@
 #include "nps/core/project_store.hpp"
+#include "nps/document/edit_graph.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -12,8 +14,11 @@
 #include <set>
 #include <sstream>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+#include <variant>
 
+#include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sqlite3.h>
@@ -42,12 +47,20 @@ namespace nps::core {
 namespace {
 
 constexpr int kProjectApplicationId = 0x4E505331;
-constexpr int kProjectUserVersion = 1;
+constexpr int kProjectUserVersionV1 = 1;
+constexpr int kProjectUserVersionV2 = 2;
 constexpr int kInjectedCrashExitCode = 86;
 constexpr std::size_t kSha256Bytes = 32;
 constexpr std::size_t kSha256HexCharacters = kSha256Bytes * 2;
+constexpr std::size_t kMaximumEditGraphJsonBytes =
+    4U * 1024U * 1024U;
 constexpr std::uintmax_t kMaximumObjectBytes =
     static_cast<std::uintmax_t>(8) * 1024U * 1024U * 1024U;
+constexpr std::string_view kProjectFormatV1 = "nps.project/v1";
+constexpr std::string_view kProjectFormatV2 = "nps.project/v2";
+constexpr std::string_view kEditGraphSchema = "nps.edit-graph/v1";
+constexpr std::string_view kWorkingColorId =
+    "nps.color/scene-linear-rec2020-d65/v1";
 
 [[nodiscard]] std::string path_to_utf8(const std::filesystem::path& path) {
   const auto bytes = path.generic_u8string();
@@ -122,6 +135,19 @@ void require_real_directory(const std::filesystem::path& path) {
   }
 }
 
+void require_real_directory_ancestry(const std::filesystem::path& path) {
+  if (!path.is_absolute()) {
+    throw_error(
+        "IO_PROJECT_PATH",
+        "A migration path could not be resolved safely.");
+  }
+  std::filesystem::path current = path.root_path();
+  for (const auto& component : path.relative_path()) {
+    current /= component;
+    require_real_directory(current);
+  }
+}
+
 [[nodiscard]] std::string sha256(std::span<const std::uint8_t> bytes) {
   std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
   unsigned int digest_size = 0;
@@ -158,6 +184,11 @@ void require_real_directory(const std::filesystem::path& path) {
     result.push_back(hex[static_cast<std::size_t>(value & 0x0FU)]);
   }
   return result;
+}
+
+[[nodiscard]] std::string sha256(std::string_view text) {
+  return sha256(std::span<const std::uint8_t>{
+      reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
 }
 
 [[nodiscard]] std::vector<std::uint8_t> read_file(
@@ -488,6 +519,12 @@ class Statement final {
     }
   }
 
+  void bind_null(int index) {
+    if (sqlite3_bind_null(statement_, index) != SQLITE_OK) {
+      throw_error("IO_DATABASE_BIND", "A project database value is invalid.");
+    }
+  }
+
   [[nodiscard]] bool row() {
     const int result = sqlite3_step(statement_);
     if (result == SQLITE_ROW) {
@@ -503,6 +540,15 @@ class Statement final {
     const int result = sqlite3_step(statement_);
     if (result != SQLITE_DONE) {
       throw_error("IO_DATABASE_STEP", "A project database update failed.");
+    }
+  }
+
+  void reset() {
+    if (sqlite3_reset(statement_) != SQLITE_OK ||
+        sqlite3_clear_bindings(statement_) != SQLITE_OK) {
+      throw_error(
+          "IO_DATABASE_STEP",
+          "A project database statement could not be reused.");
     }
   }
 
@@ -523,6 +569,10 @@ class Statement final {
     return {
         reinterpret_cast<const char*>(value),
         static_cast<std::size_t>(bytes)};
+  }
+
+  [[nodiscard]] bool is_null(int column) const noexcept {
+    return sqlite3_column_type(statement_, column) == SQLITE_NULL;
   }
 
  private:
@@ -589,6 +639,196 @@ void configure_database(const Database& database) {
   database.exec("PRAGMA synchronous = FULL;");
   database.exec("PRAGMA temp_store = MEMORY;");
   database.exec("PRAGMA trusted_schema = OFF;");
+  database.exec("PRAGMA legacy_alter_table = OFF;");
+  database.exec("PRAGMA writable_schema = OFF;");
+  database.exec("PRAGMA ignore_check_constraints = OFF;");
+  database.exec("PRAGMA recursive_triggers = OFF;");
+}
+
+void configure_read_only_database(const Database& database) {
+  database.exec("PRAGMA foreign_keys = ON;");
+  database.exec("PRAGMA temp_store = MEMORY;");
+  database.exec("PRAGMA trusted_schema = OFF;");
+  database.exec("PRAGMA legacy_alter_table = OFF;");
+  database.exec("PRAGMA writable_schema = OFF;");
+  database.exec("PRAGMA ignore_check_constraints = OFF;");
+  database.exec("PRAGMA recursive_triggers = OFF;");
+  database.exec("PRAGMA query_only = ON;");
+}
+
+[[nodiscard]] std::optional<std::string_view> expected_table_sql(
+    const std::string_view name,
+    const int format_version) {
+  if (name == "meta") {
+    return "CREATE TABLE meta(key TEXT PRIMARY KEY NOT NULL,"
+           "value TEXT NOT NULL) STRICT";
+  }
+  if (name == "objects") {
+    return "CREATE TABLE objects(hash TEXT PRIMARY KEY NOT NULL,"
+           "byte_size INTEGER NOT NULL CHECK(byte_size > 0),"
+           "media_type TEXT NOT NULL) STRICT";
+  }
+  if (name == "snapshots") {
+    if (format_version == kProjectUserVersionV1) {
+      return "CREATE TABLE snapshots(id INTEGER PRIMARY KEY,"
+             "parent_snapshot_id INTEGER REFERENCES snapshots(id),"
+             "created_revision INTEGER NOT NULL UNIQUE,"
+             "source_hash TEXT NOT NULL REFERENCES objects(hash),"
+             "exposure_ev REAL NOT NULL) STRICT";
+    }
+    if (format_version == kProjectUserVersionV2) {
+      return "CREATE TABLE \"snapshots\"(id INTEGER PRIMARY KEY,"
+             "parent_snapshot_id INTEGER REFERENCES \"snapshots\"(id),"
+             "created_revision INTEGER NOT NULL UNIQUE,"
+             "source_hash TEXT NOT NULL REFERENCES objects(hash),"
+             "exposure_ev REAL NOT NULL,"
+             "edit_graph_json TEXT NOT NULL "
+             "CHECK(length(edit_graph_json) BETWEEN 1 AND 4194304),"
+             "edit_graph_sha256 TEXT NOT NULL "
+             "CHECK(length(edit_graph_sha256) = 64),"
+             "working_color_id TEXT NOT NULL) STRICT";
+    }
+    return std::nullopt;
+  }
+  if (name == "history") {
+    return "CREATE TABLE history("
+           "position INTEGER PRIMARY KEY CHECK(position >= 0),"
+           "snapshot_id INTEGER NOT NULL REFERENCES snapshots(id)) STRICT";
+  }
+  if (name == "transactions") {
+    return "CREATE TABLE transactions("
+           "revision INTEGER PRIMARY KEY CHECK(revision > 0),"
+           "base_revision INTEGER NOT NULL CHECK(base_revision >= 0),"
+           "command_id TEXT NOT NULL UNIQUE,"
+           "idempotency_key TEXT NOT NULL UNIQUE,"
+           "request_fingerprint TEXT NOT NULL,"
+           "kind TEXT NOT NULL,"
+           "snapshot_id INTEGER NOT NULL REFERENCES snapshots(id)) STRICT";
+  }
+  if (name == "idempotency") {
+    return "CREATE TABLE idempotency("
+           "idempotency_key TEXT PRIMARY KEY NOT NULL,"
+           "request_fingerprint TEXT NOT NULL,"
+           "command_id TEXT NOT NULL,"
+           "base_revision INTEGER NOT NULL,"
+           "new_revision INTEGER NOT NULL,"
+           "snapshot_id INTEGER NOT NULL REFERENCES snapshots(id)) STRICT";
+  }
+  return std::nullopt;
+}
+
+void validate_database_schema(
+    const Database& database,
+    const int format_version) {
+  constexpr std::array<std::pair<std::string_view, std::string_view>, 6>
+      expected_indexes{{
+          {"sqlite_autoindex_idempotency_1", "idempotency"},
+          {"sqlite_autoindex_meta_1", "meta"},
+          {"sqlite_autoindex_objects_1", "objects"},
+          {"sqlite_autoindex_snapshots_1", "snapshots"},
+          {"sqlite_autoindex_transactions_1", "transactions"},
+          {"sqlite_autoindex_transactions_2", "transactions"},
+      }};
+  std::set<std::string> seen_tables;
+  std::set<std::string> seen_indexes;
+  Statement objects(
+      database.get(),
+      "SELECT type, name, tbl_name, sql "
+      "FROM sqlite_schema ORDER BY type, name;");
+  while (objects.row()) {
+    const std::string type = objects.text(0);
+    const std::string name = objects.text(1);
+    const std::string table = objects.text(2);
+    if (type == "table") {
+      const auto expected_sql =
+          expected_table_sql(name, format_version);
+      if (!expected_sql.has_value() || table != name ||
+          objects.is_null(3) || objects.text(3) != *expected_sql ||
+          !seen_tables.insert(name).second) {
+        throw_error(
+            "IO_PROJECT_SCHEMA",
+            "The project database schema is not the exact supported format.");
+      }
+      continue;
+    }
+    if (type == "index") {
+      const auto expected = std::ranges::find_if(
+          expected_indexes,
+          [&name, &table](const auto& candidate) {
+            return candidate.first == name &&
+                   candidate.second == table;
+          });
+      if (expected == expected_indexes.end() ||
+          !objects.is_null(3) ||
+          !seen_indexes.insert(name).second) {
+        throw_error(
+            "IO_PROJECT_SCHEMA",
+            "The project database schema is not the exact supported format.");
+      }
+      continue;
+    }
+    throw_error(
+        "IO_PROJECT_SCHEMA",
+        "The project database schema contains an unsupported object.");
+  }
+  if (seen_tables.size() != 6U ||
+      seen_indexes.size() != expected_indexes.size()) {
+    throw_error(
+        "IO_PROJECT_SCHEMA",
+        "The project database schema is incomplete.");
+  }
+
+  const std::set<std::string> expected_meta_keys =
+      format_version == kProjectUserVersionV2
+          ? std::set<std::string>{
+                "clean_shutdown",
+                "current_revision",
+                "current_snapshot_id",
+                "document_id",
+                "format",
+                "history_position",
+                "migration_source_document_id",
+                "migration_source_fingerprint",
+                "migration_source_format"}
+          : std::set<std::string>{
+                "clean_shutdown",
+                "current_revision",
+                "current_snapshot_id",
+                "document_id",
+                "format",
+                "history_position"};
+  std::set<std::string> actual_meta_keys;
+  Statement meta_keys(
+      database.get(), "SELECT key FROM meta ORDER BY key;");
+  while (meta_keys.row()) {
+    if (!actual_meta_keys.insert(meta_keys.text(0)).second) {
+      throw_error(
+          "IO_PROJECT_SCHEMA",
+          "The project metadata schema is ambiguous.");
+    }
+  }
+  if (actual_meta_keys != expected_meta_keys) {
+    throw_error(
+        "IO_PROJECT_SCHEMA",
+        "The project metadata schema is not the exact supported format.");
+  }
+}
+
+void backup_database(const Database& source, const Database& destination) {
+  sqlite3_backup* backup = sqlite3_backup_init(
+      destination.get(), "main", source.get(), "main");
+  if (backup == nullptr) {
+    throw_error(
+        "IO_MIGRATION_BACKUP",
+        "The source project database could not be backed up.");
+  }
+  const int step_result = sqlite3_backup_step(backup, -1);
+  const int finish_result = sqlite3_backup_finish(backup);
+  if (step_result != SQLITE_DONE || finish_result != SQLITE_OK) {
+    throw_error(
+        "IO_MIGRATION_BACKUP",
+        "The source project database backup did not complete.");
+  }
 }
 
 void rollback_noexcept(const Database& database) noexcept {
@@ -647,13 +887,486 @@ void set_meta_integer(
   return parsed;
 }
 
+[[nodiscard]] int validate_database_format(
+    const Database& database,
+    const std::optional<int> required_version = std::nullopt) {
+  {
+    Statement application_id(database.get(), "PRAGMA application_id;");
+    if (!application_id.row() ||
+        application_id.integer(0) != kProjectApplicationId ||
+        application_id.row()) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "The project application identifier is invalid.");
+    }
+  }
+
+  int format_version = 0;
+  {
+    Statement user_version(database.get(), "PRAGMA user_version;");
+    if (!user_version.row()) {
+      throw_error(
+          "IO_PROJECT_VERSION",
+          "The project format version is unsupported.");
+    }
+    const std::int64_t version = user_version.integer(0);
+    if (user_version.row() ||
+        (version != kProjectUserVersionV1 &&
+         version != kProjectUserVersionV2) ||
+        (required_version.has_value() &&
+         version != *required_version)) {
+      throw_error(
+          "IO_PROJECT_VERSION",
+          "The project format version is unsupported.");
+    }
+    format_version = static_cast<int>(version);
+  }
+
+  validate_database_schema(database, format_version);
+  const std::string_view expected_format =
+      format_version == kProjectUserVersionV2
+          ? kProjectFormatV2
+          : kProjectFormatV1;
+  if (get_meta(database, "format") != expected_format) {
+    throw_error(
+        "IO_PROJECT_VERSION",
+        "The project format version is unsupported.");
+  }
+  return format_version;
+}
+
+[[nodiscard]] bool has_exact_json_keys(
+    const nlohmann::json& value,
+    std::initializer_list<std::string_view> required,
+    std::initializer_list<std::string_view> optional = {}) {
+  if (!value.is_object()) {
+    return false;
+  }
+  for (const std::string_view key : required) {
+    if (!value.contains(std::string(key))) {
+      return false;
+    }
+  }
+  for (const auto& [key, ignored] : value.items()) {
+    static_cast<void>(ignored);
+    const bool is_required =
+        std::ranges::find(required, std::string_view(key)) != required.end();
+    const bool is_optional =
+        std::ranges::find(optional, std::string_view(key)) != optional.end();
+    if (!is_required && !is_optional) {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] bool is_finite_json_number(const nlohmann::json& value) {
+  if (!value.is_number()) {
+    return false;
+  }
+  try {
+    const double parsed = value.get<double>();
+    return std::isfinite(parsed) &&
+           !(parsed == 0.0 && std::signbit(parsed));
+  } catch (const nlohmann::json::exception&) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool is_stable_graph_identifier(std::string_view value) {
+  if (value.empty() || value.size() > 128U) {
+    return false;
+  }
+  const auto ascii_alphanumeric = [](char character) {
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9');
+  };
+  if (!ascii_alphanumeric(value.front())) {
+    return false;
+  }
+  return std::ranges::all_of(value, [&](char character) {
+    return ascii_alphanumeric(character) || character == '.' ||
+           character == '_' || character == ':' || character == '-';
+  });
+}
+
+[[nodiscard]] bool validate_canonical_edit_graph(
+    std::string_view canonical_json,
+    std::string_view expected_working_color) {
+  if (canonical_json.empty() ||
+      canonical_json.size() > kMaximumEditGraphJsonBytes ||
+      expected_working_color != kWorkingColorId) {
+    return false;
+  }
+  const auto parsed =
+      nps::document::parse_edit_graph_json(canonical_json);
+  const auto* graph =
+      std::get_if<nps::document::EditGraph>(&parsed);
+  if (graph == nullptr ||
+      graph->working_color_space() != expected_working_color ||
+      nps::document::canonical_edit_graph_json(*graph) != canonical_json) {
+    return false;
+  }
+
+  nlohmann::json root;
+  try {
+    root = nlohmann::json::parse(
+        canonical_json.begin(), canonical_json.end());
+  } catch (const nlohmann::json::exception&) {
+    return false;
+  }
+  if (root.dump() != canonical_json ||
+      !has_exact_json_keys(
+          root,
+          {"schema", "graphId", "workingColorSpace", "sourceNodeId",
+           "outputNodeId", "nodes"}) ||
+      !root.at("schema").is_string() ||
+      root.at("schema").get_ref<const std::string&>() != kEditGraphSchema ||
+      !root.at("graphId").is_string() ||
+      !is_stable_graph_identifier(
+          root.at("graphId").get_ref<const std::string&>()) ||
+      !root.at("workingColorSpace").is_string() ||
+      root.at("workingColorSpace").get_ref<const std::string&>() !=
+          expected_working_color ||
+      !root.at("sourceNodeId").is_string() ||
+      !root.at("outputNodeId").is_string() ||
+      !root.at("nodes").is_array() || root.at("nodes").empty() ||
+      root.at("nodes").size() > 4096U) {
+    return false;
+  }
+
+  struct NodeShape {
+    std::string type;
+    std::vector<std::string> inputs;
+  };
+  std::unordered_map<std::string, NodeShape> nodes;
+  nodes.reserve(root.at("nodes").size());
+  std::string previous_node_id;
+  std::size_t source_count = 0U;
+  std::size_t output_count = 0U;
+
+  for (const nlohmann::json& node : root.at("nodes")) {
+    if (!has_exact_json_keys(
+            node,
+            {"nodeId", "type", "algorithmVersion", "enabled", "opacity",
+             "computeDomain", "inputs", "parameters"},
+            {"mask"}) ||
+        !node.at("nodeId").is_string() || !node.at("type").is_string() ||
+        !node.at("algorithmVersion").is_string() ||
+        node.at("algorithmVersion").get_ref<const std::string&>() != "1.0.0" ||
+        !node.at("enabled").is_boolean() ||
+        !is_finite_json_number(node.at("opacity")) ||
+        node.at("opacity").get<double>() < 0.0 ||
+        node.at("opacity").get<double>() > 1.0 ||
+        !node.at("computeDomain").is_string() ||
+        node.at("computeDomain").get_ref<const std::string&>() !=
+            "scene-linear" ||
+        !node.at("inputs").is_array() ||
+        !node.at("parameters").is_object()) {
+      return false;
+    }
+
+    const std::string node_id =
+        node.at("nodeId").get_ref<const std::string&>();
+    const std::string type = node.at("type").get_ref<const std::string&>();
+    if (!is_stable_graph_identifier(node_id) ||
+        (!previous_node_id.empty() && node_id <= previous_node_id) ||
+        (type != "source" && type != "adjust.exposure" &&
+         type != "adjust.curve.rgb" && type != "output")) {
+      return false;
+    }
+    previous_node_id = node_id;
+
+    std::vector<std::string> inputs;
+    inputs.reserve(node.at("inputs").size());
+    for (const nlohmann::json& input : node.at("inputs")) {
+      if (!input.is_string() ||
+          !is_stable_graph_identifier(
+              input.get_ref<const std::string&>())) {
+        return false;
+      }
+      inputs.push_back(input.get_ref<const std::string&>());
+    }
+
+    if (node.contains("mask")) {
+      const nlohmann::json& mask = node.at("mask");
+      if ((type == "source" || type == "output") ||
+          !has_exact_json_keys(
+              mask, {"maskId", "contentHash", "inverted"}) ||
+          !mask.at("maskId").is_string() ||
+          !is_stable_graph_identifier(
+              mask.at("maskId").get_ref<const std::string&>()) ||
+          !mask.at("contentHash").is_string() ||
+          !is_lower_hex(
+              mask.at("contentHash").get_ref<const std::string&>()) ||
+          !mask.at("inverted").is_boolean()) {
+        return false;
+      }
+    }
+
+    const nlohmann::json& parameters = node.at("parameters");
+    if (type == "source") {
+      ++source_count;
+      if (!node.at("enabled").get<bool>() ||
+          node.at("opacity").get<double>() != 1.0 ||
+          !inputs.empty() || !parameters.empty()) {
+        return false;
+      }
+    } else if (type == "output") {
+      ++output_count;
+      if (!node.at("enabled").get<bool>() ||
+          node.at("opacity").get<double>() != 1.0 ||
+          inputs.size() != 1U || !parameters.empty()) {
+        return false;
+      }
+    } else if (type == "adjust.exposure") {
+      if (inputs.size() != 1U ||
+          !has_exact_json_keys(parameters, {"ev"}) ||
+          !is_finite_json_number(parameters.at("ev")) ||
+          parameters.at("ev").get<double>() < -10.0 ||
+          parameters.at("ev").get<double>() > 10.0) {
+        return false;
+      }
+    } else {
+      if (inputs.size() != 1U ||
+          !has_exact_json_keys(parameters, {"points"}) ||
+          !parameters.at("points").is_array() ||
+          parameters.at("points").size() < 2U ||
+          parameters.at("points").size() > 256U) {
+        return false;
+      }
+      double previous_x = -1.0;
+      std::size_t point_index = 0U;
+      for (const nlohmann::json& point : parameters.at("points")) {
+        if (!has_exact_json_keys(point, {"x", "y"}) ||
+            !is_finite_json_number(point.at("x")) ||
+            !is_finite_json_number(point.at("y"))) {
+          return false;
+        }
+        const double x = point.at("x").get<double>();
+        const double y = point.at("y").get<double>();
+        if (x < 0.0 || x > 1.0 || y < 0.0 || y > 1.0 ||
+            x <= previous_x ||
+            (point_index == 0U && x != 0.0)) {
+          return false;
+        }
+        previous_x = x;
+        ++point_index;
+      }
+      if (previous_x != 1.0) {
+        return false;
+      }
+    }
+
+    if (!nodes.emplace(
+             node_id,
+             NodeShape{.type = type, .inputs = std::move(inputs)})
+             .second) {
+      return false;
+    }
+  }
+
+  const std::string source_id =
+      root.at("sourceNodeId").get_ref<const std::string&>();
+  const std::string output_id =
+      root.at("outputNodeId").get_ref<const std::string&>();
+  const auto source = nodes.find(source_id);
+  const auto output = nodes.find(output_id);
+  if (source_count != 1U || output_count != 1U ||
+      source == nodes.end() || source->second.type != "source" ||
+      output == nodes.end() || output->second.type != "output") {
+    return false;
+  }
+
+  std::unordered_map<std::string, std::size_t> indegree;
+  std::unordered_map<std::string, std::vector<std::string>> dependents;
+  indegree.reserve(nodes.size());
+  dependents.reserve(nodes.size());
+  for (const auto& [node_id, shape] : nodes) {
+    indegree[node_id] = shape.inputs.size();
+    for (const std::string& input : shape.inputs) {
+      if (!nodes.contains(input) || input == node_id) {
+        return false;
+      }
+      dependents[input].push_back(node_id);
+    }
+  }
+
+  std::vector<std::string> ready;
+  ready.reserve(nodes.size());
+  for (const auto& [node_id, degree] : indegree) {
+    if (degree == 0U) {
+      ready.push_back(node_id);
+    }
+  }
+  std::size_t visited = 0U;
+  while (!ready.empty()) {
+    const std::string node_id = std::move(ready.back());
+    ready.pop_back();
+    ++visited;
+    for (const std::string& dependent : dependents[node_id]) {
+      std::size_t& degree = indegree[dependent];
+      if (--degree == 0U) {
+        ready.push_back(dependent);
+      }
+    }
+  }
+  if (visited != nodes.size()) {
+    return false;
+  }
+
+  std::set<std::string> reachable;
+  std::vector<std::string> pending{output_id};
+  while (!pending.empty()) {
+    std::string node_id = std::move(pending.back());
+    pending.pop_back();
+    if (!reachable.insert(node_id).second) {
+      continue;
+    }
+    for (const std::string& input : nodes.at(node_id).inputs) {
+      pending.push_back(input);
+    }
+  }
+  return reachable.size() == nodes.size() && reachable.contains(source_id);
+}
+
+[[nodiscard]] nlohmann::json source_node_json() {
+  return {
+      {"nodeId", "source"},
+      {"type", "source"},
+      {"algorithmVersion", "1.0.0"},
+      {"enabled", true},
+      {"opacity", 1.0},
+      {"computeDomain", "scene-linear"},
+      {"inputs", nlohmann::json::array()},
+      {"parameters", nlohmann::json::object()}};
+}
+
+[[nodiscard]] nlohmann::json output_node_json(std::string input) {
+  return {
+      {"nodeId", "output"},
+      {"type", "output"},
+      {"algorithmVersion", "1.0.0"},
+      {"enabled", true},
+      {"opacity", 1.0},
+      {"computeDomain", "scene-linear"},
+      {"inputs", nlohmann::json::array({std::move(input)})},
+      {"parameters", nlohmann::json::object()}};
+}
+
+[[nodiscard]] nlohmann::json exposure_node_json(
+    std::string node_id,
+    std::string input,
+    double exposure_delta_ev) {
+  if (exposure_delta_ev == 0.0) {
+    exposure_delta_ev = 0.0;
+  }
+  return {
+      {"nodeId", std::move(node_id)},
+      {"type", "adjust.exposure"},
+      {"algorithmVersion", "1.0.0"},
+      {"enabled", true},
+      {"opacity", 1.0},
+      {"computeDomain", "scene-linear"},
+      {"inputs", nlohmann::json::array({std::move(input)})},
+      {"parameters", {{"ev", exposure_delta_ev}}}};
+}
+
+[[nodiscard]] std::string canonical_graph_json(
+    std::string graph_id,
+    std::vector<nlohmann::json> exposure_nodes) {
+  std::string output_input = "source";
+  if (!exposure_nodes.empty()) {
+    output_input = exposure_nodes.back().at("nodeId").get<std::string>();
+  }
+
+  nlohmann::json nodes = nlohmann::json::array();
+  for (nlohmann::json& node : exposure_nodes) {
+    nodes.push_back(std::move(node));
+  }
+  nodes.push_back(output_node_json(std::move(output_input)));
+  nodes.push_back(source_node_json());
+
+  return nlohmann::json{
+      {"schema", std::string(kEditGraphSchema)},
+      {"graphId", std::move(graph_id)},
+      {"workingColorSpace", std::string(kWorkingColorId)},
+      {"sourceNodeId", "source"},
+      {"outputNodeId", "output"},
+      {"nodes", std::move(nodes)}}
+      .dump();
+}
+
+[[nodiscard]] std::string append_exposure_to_graph(
+    std::string_view canonical_json,
+    std::string graph_id,
+    std::string node_id,
+    double exposure_delta_ev) {
+  nlohmann::json root =
+      nlohmann::json::parse(canonical_json.begin(), canonical_json.end());
+  nlohmann::json& nodes = root.at("nodes");
+  const std::string& output_node_id =
+      root.at("outputNodeId").get_ref<const std::string&>();
+  auto output = std::ranges::find_if(
+      nodes,
+      [&output_node_id](const nlohmann::json& node) {
+        return node.at("nodeId").get_ref<const std::string&>() ==
+               output_node_id;
+      });
+  if (output == nodes.end()) {
+    throw_error("IO_PROJECT_FORMAT", "The snapshot edit graph is invalid.");
+  }
+  const std::string requested_node_id = node_id;
+  std::size_t suffix = 0U;
+  const auto node_id_exists = [&nodes](std::string_view candidate) {
+    return std::ranges::any_of(
+        nodes,
+        [candidate](const nlohmann::json& node) {
+          return node.at("nodeId").get_ref<const std::string&>() ==
+                 candidate;
+        });
+  };
+  while (node_id_exists(node_id)) {
+    ++suffix;
+    node_id =
+        requested_node_id + "-auto-" + std::to_string(suffix);
+  }
+  const std::string previous_input =
+      output->at("inputs").at(0).get<std::string>();
+  output->at("inputs") = nlohmann::json::array({node_id});
+  nodes.push_back(exposure_node_json(
+      std::move(node_id), previous_input, exposure_delta_ev));
+  std::vector<nlohmann::json> sorted_nodes;
+  sorted_nodes.reserve(nodes.size());
+  for (nlohmann::json& node : nodes) {
+    sorted_nodes.push_back(std::move(node));
+  }
+  std::ranges::sort(
+      sorted_nodes,
+      [](const nlohmann::json& left, const nlohmann::json& right) {
+        return left.at("nodeId").get_ref<const std::string&>() <
+               right.at("nodeId").get_ref<const std::string&>();
+      });
+  root.at("nodes") = std::move(sorted_nodes);
+  root.at("graphId") = std::move(graph_id);
+  return root.dump();
+}
+
 [[nodiscard]] Snapshot read_snapshot(
     const Database& database,
-    std::int64_t snapshot_id) {
+    std::int64_t snapshot_id,
+    int format_version) {
+  const std::string query =
+      format_version == kProjectUserVersionV2
+          ? "SELECT id, created_revision, source_hash, exposure_ev, "
+            "edit_graph_json, edit_graph_sha256, working_color_id "
+            "FROM snapshots WHERE id = ?1;"
+          : "SELECT id, created_revision, source_hash, exposure_ev "
+            "FROM snapshots WHERE id = ?1;";
   Statement statement(
       database.get(),
-      "SELECT id, created_revision, source_hash, exposure_ev "
-      "FROM snapshots WHERE id = ?1;");
+      query);
   statement.bind(1, snapshot_id);
   if (!statement.row()) {
     throw_error("IO_PROJECT_FORMAT", "The current snapshot is missing.");
@@ -663,12 +1376,26 @@ void set_meta_integer(
       .created_revision = statement.integer(1),
       .source_hash = statement.text(2),
       .exposure_ev = statement.real(3)};
+  if (format_version == kProjectUserVersionV2) {
+    snapshot.edit_graph_json = statement.text(4);
+    snapshot.edit_graph_sha256 = statement.text(5);
+    snapshot.working_color_id = statement.text(6);
+  }
   if (statement.row()) {
     throw_error("IO_PROJECT_FORMAT", "The current snapshot is ambiguous.");
   }
   if (!is_lower_hex(snapshot.source_hash) ||
       !std::isfinite(snapshot.exposure_ev)) {
     throw_error("IO_PROJECT_FORMAT", "The current snapshot is invalid.");
+  }
+  if (format_version == kProjectUserVersionV2 &&
+      (!is_lower_hex(snapshot.edit_graph_sha256) ||
+       sha256(snapshot.edit_graph_json) != snapshot.edit_graph_sha256 ||
+       !validate_canonical_edit_graph(
+           snapshot.edit_graph_json, snapshot.working_color_id))) {
+    throw_error(
+        "IO_PROJECT_FORMAT",
+        "The current snapshot edit graph is invalid.");
   }
   return snapshot;
 }
@@ -703,6 +1430,8 @@ void set_meta_integer(
   switch (mutation) {
     case StoreMutation::adjust_exposure:
       return "adjust.exposure";
+    case StoreMutation::replace_graph:
+      return "graph.replace";
     case StoreMutation::undo:
       return "history.undo";
     case StoreMutation::redo:
@@ -741,6 +1470,378 @@ void check_database_integrity(const Database& database) {
   }
 }
 
+[[nodiscard]] std::string migration_source_fingerprint(
+    const Database& database,
+    const bool project_is_v2 = false) {
+  nlohmann::json facts;
+  facts["meta"] = nlohmann::json::array();
+  if (project_is_v2) {
+    for (const std::string_view key :
+         {"current_revision",
+          "current_snapshot_id",
+          "document_id"}) {
+      facts["meta"].push_back(nlohmann::json::array(
+          {key, get_meta(database, key)}));
+    }
+    facts["meta"].push_back(
+        nlohmann::json::array({"format", kProjectFormatV1}));
+    facts["meta"].push_back(nlohmann::json::array(
+        {"history_position", get_meta(database, "history_position")}));
+  } else {
+    Statement rows(
+        database.get(),
+        "SELECT key, value FROM meta WHERE key <> 'clean_shutdown' "
+        "ORDER BY key;");
+    while (rows.row()) {
+      facts["meta"].push_back(
+          nlohmann::json::array({rows.text(0), rows.text(1)}));
+    }
+  }
+  facts["objects"] = nlohmann::json::array();
+  {
+    Statement rows(
+        database.get(),
+        "SELECT hash, byte_size, media_type FROM objects ORDER BY hash;");
+    while (rows.row()) {
+      facts["objects"].push_back(nlohmann::json::array(
+          {rows.text(0), rows.integer(1), rows.text(2)}));
+    }
+  }
+  facts["snapshots"] = nlohmann::json::array();
+  {
+    Statement rows(
+        database.get(),
+        "SELECT id, parent_snapshot_id, created_revision, source_hash, "
+        "exposure_ev FROM snapshots ORDER BY id;");
+    while (rows.row()) {
+      nlohmann::json parent = nullptr;
+      if (!rows.is_null(1)) {
+        parent = rows.integer(1);
+      }
+      facts["snapshots"].push_back(nlohmann::json::array(
+          {rows.integer(0),
+           std::move(parent),
+           rows.integer(2),
+           rows.text(3),
+           rows.real(4)}));
+    }
+  }
+  facts["history"] = nlohmann::json::array();
+  {
+    Statement rows(
+        database.get(),
+        "SELECT position, snapshot_id FROM history ORDER BY position;");
+    while (rows.row()) {
+      facts["history"].push_back(
+          nlohmann::json::array({rows.integer(0), rows.integer(1)}));
+    }
+  }
+  facts["transactions"] = nlohmann::json::array();
+  {
+    Statement rows(
+        database.get(),
+        "SELECT revision, base_revision, command_id, idempotency_key, "
+        "request_fingerprint, kind, snapshot_id "
+        "FROM transactions ORDER BY revision;");
+    while (rows.row()) {
+      facts["transactions"].push_back(nlohmann::json::array(
+          {rows.integer(0),
+           rows.integer(1),
+           rows.text(2),
+           rows.text(3),
+           rows.text(4),
+           rows.text(5),
+           rows.integer(6)}));
+    }
+  }
+  facts["idempotency"] = nlohmann::json::array();
+  {
+    Statement rows(
+        database.get(),
+        "SELECT idempotency_key, request_fingerprint, command_id, "
+        "base_revision, new_revision, snapshot_id "
+        "FROM idempotency ORDER BY idempotency_key;");
+    while (rows.row()) {
+      facts["idempotency"].push_back(nlohmann::json::array(
+          {rows.text(0),
+           rows.text(1),
+           rows.text(2),
+           rows.integer(3),
+           rows.integer(4),
+           rows.integer(5)}));
+    }
+  }
+  return sha256(facts.dump());
+}
+
+void validate_v1_migration_semantics(const Database& database) {
+  struct LegacySnapshotShape {
+    std::optional<std::int64_t> parent_id;
+    std::int64_t created_revision{};
+    double exposure_ev{};
+  };
+  std::unordered_map<std::int64_t, LegacySnapshotShape> snapshots;
+  {
+    Statement rows(
+        database.get(),
+        "SELECT id, parent_snapshot_id, created_revision, exposure_ev "
+        "FROM snapshots ORDER BY id;");
+    while (rows.row()) {
+      const std::int64_t snapshot_id = rows.integer(0);
+      std::optional<std::int64_t> parent_id;
+      if (!rows.is_null(1)) {
+        parent_id = rows.integer(1);
+      }
+      const LegacySnapshotShape shape{
+          .parent_id = parent_id,
+          .created_revision = rows.integer(2),
+          .exposure_ev = rows.real(3)};
+      if (snapshot_id <= 0 || shape.created_revision < 0 ||
+          !std::isfinite(shape.exposure_ev) ||
+          !snapshots.emplace(snapshot_id, shape).second) {
+        throw_error(
+            "IO_PROJECT_FORMAT",
+            "The legacy snapshot structure is invalid.");
+      }
+    }
+  }
+  const auto initial = snapshots.find(1);
+  if (snapshots.empty() || initial == snapshots.end() ||
+      initial->second.parent_id.has_value() ||
+      initial->second.created_revision != 0 ||
+      initial->second.exposure_ev != 0.0) {
+    throw_error(
+        "IO_PROJECT_FORMAT",
+        "The legacy initial snapshot is invalid.");
+  }
+
+  std::size_t root_count = 0U;
+  for (const auto& [snapshot_id, shape] : snapshots) {
+    if (!shape.parent_id.has_value()) {
+      ++root_count;
+      if (snapshot_id != 1) {
+        throw_error(
+            "IO_PROJECT_FORMAT",
+            "The legacy project has an unexpected snapshot root.");
+      }
+      continue;
+    }
+    const auto parent = snapshots.find(*shape.parent_id);
+    if (parent == snapshots.end() ||
+        parent->second.created_revision >= shape.created_revision) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "The legacy snapshot ancestry is invalid.");
+    }
+    const double delta = shape.exposure_ev - parent->second.exposure_ev;
+    if (!std::isfinite(delta) || delta < -10.0 || delta > 10.0) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "A legacy snapshot is inconsistent with an exposure command.");
+    }
+  }
+  if (root_count != 1U) {
+    throw_error(
+        "IO_PROJECT_FORMAT",
+        "The legacy project must contain exactly one snapshot root.");
+  }
+
+  {
+    Statement invalid_transactions(
+        database.get(),
+        "SELECT 1 FROM transactions "
+        "WHERE base_revision <> revision - 1 "
+        "OR kind NOT IN ('adjust.exposure', 'history.undo', 'history.redo') "
+        "LIMIT 1;");
+    if (invalid_transactions.row()) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "The legacy transaction sequence is invalid.");
+    }
+  }
+  {
+    Statement invalid_snapshot_transactions(
+        database.get(),
+        "SELECT 1 FROM snapshots AS s "
+        "LEFT JOIN transactions AS t ON t.revision = s.created_revision "
+        "WHERE s.created_revision > 0 "
+        "AND (t.revision IS NULL OR t.kind <> 'adjust.exposure' "
+        "OR t.snapshot_id <> s.id) LIMIT 1;");
+    if (invalid_snapshot_transactions.row()) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "A legacy snapshot is missing its creation transaction.");
+    }
+  }
+  {
+    Statement invalid_idempotency(
+        database.get(),
+        "SELECT 1 FROM idempotency AS i "
+        "LEFT JOIN transactions AS t "
+        "ON t.idempotency_key = i.idempotency_key "
+        "WHERE t.revision IS NULL "
+        "OR t.request_fingerprint <> i.request_fingerprint "
+        "OR t.command_id <> i.command_id "
+        "OR t.base_revision <> i.base_revision "
+        "OR t.revision <> i.new_revision "
+        "OR t.snapshot_id <> i.snapshot_id LIMIT 1;");
+    if (invalid_idempotency.row()) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "The legacy idempotency log is invalid.");
+    }
+    Statement counts(
+        database.get(),
+        "SELECT (SELECT COUNT(*) FROM transactions), "
+        "(SELECT COUNT(*) FROM idempotency);");
+    if (!counts.row() || counts.integer(0) != counts.integer(1) ||
+        counts.row()) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "The legacy transaction and idempotency logs disagree.");
+    }
+  }
+}
+
+[[nodiscard]] std::string fixed_width_node_index(std::size_t index) {
+  std::string value = std::to_string(index);
+  if (value.size() > 10U) {
+    throw_error(
+        "IO_MIGRATION_GRAPH_LIMIT",
+        "A legacy exposure cannot be represented by the v2 graph limit.");
+  }
+  return std::string(10U - value.size(), '0') + value;
+}
+
+[[nodiscard]] std::string migrated_graph_for_exposure(
+    std::int64_t snapshot_id,
+    double exposure_ev) {
+  if (!std::isfinite(exposure_ev)) {
+    throw_error(
+        "IO_PROJECT_FORMAT",
+        "A legacy snapshot exposure is invalid.");
+  }
+
+  std::vector<nlohmann::json> exposure_nodes;
+  std::string input = "source";
+  double remaining = exposure_ev == 0.0 ? 0.0 : exposure_ev;
+  for (std::size_t index = 1U; remaining != 0.0; ++index) {
+    if (index > 4094U) {
+      throw_error(
+          "IO_MIGRATION_GRAPH_LIMIT",
+          "A legacy exposure cannot be represented by the v2 graph limit.");
+    }
+    double delta = remaining;
+    if (delta > 10.0) {
+      delta = 10.0;
+    } else if (delta < -10.0) {
+      delta = -10.0;
+    }
+    const std::string node_id =
+        "adjust-exposure-" + fixed_width_node_index(index);
+    exposure_nodes.push_back(
+        exposure_node_json(node_id, input, delta));
+    input = node_id;
+    const double next = remaining - delta;
+    if (next == remaining) {
+      throw_error(
+          "IO_MIGRATION_GRAPH_LIMIT",
+          "A legacy exposure cannot be represented by the v2 graph limit.");
+    }
+    remaining = next == 0.0 ? 0.0 : next;
+  }
+  const std::string graph = canonical_graph_json(
+      "graph-migrated-snapshot-" + std::to_string(snapshot_id),
+      std::move(exposure_nodes));
+  if (!validate_canonical_edit_graph(graph, kWorkingColorId)) {
+    throw_error(
+        "IO_MIGRATION_GRAPH",
+        "A migrated snapshot edit graph failed validation.");
+  }
+  return graph;
+}
+
+void transform_database_v1_to_v2(
+    Database& database,
+    std::string_view source_fingerprint) {
+  database.exec("PRAGMA foreign_keys = OFF;");
+  database.exec("BEGIN EXCLUSIVE;");
+  try {
+    database.exec(
+        "CREATE TABLE snapshots_v2("
+        "id INTEGER PRIMARY KEY,"
+        "parent_snapshot_id INTEGER REFERENCES snapshots_v2(id),"
+        "created_revision INTEGER NOT NULL UNIQUE,"
+        "source_hash TEXT NOT NULL REFERENCES objects(hash),"
+        "exposure_ev REAL NOT NULL,"
+        "edit_graph_json TEXT NOT NULL "
+        "CHECK(length(edit_graph_json) BETWEEN 1 AND 4194304),"
+        "edit_graph_sha256 TEXT NOT NULL CHECK(length(edit_graph_sha256) = 64),"
+        "working_color_id TEXT NOT NULL"
+        ") STRICT;");
+
+    {
+      Statement legacy(
+          database.get(),
+          "SELECT id, parent_snapshot_id, created_revision, source_hash, "
+          "exposure_ev FROM snapshots ORDER BY id;");
+      Statement migrated(
+          database.get(),
+          "INSERT INTO snapshots_v2("
+          "id, parent_snapshot_id, created_revision, source_hash, exposure_ev, "
+          "edit_graph_json, edit_graph_sha256, working_color_id"
+          ") VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);");
+      while (legacy.row()) {
+        const std::int64_t snapshot_id = legacy.integer(0);
+        const double exposure_ev = legacy.real(4);
+        const std::string graph =
+            migrated_graph_for_exposure(snapshot_id, exposure_ev);
+        migrated.bind(1, snapshot_id);
+        if (legacy.is_null(1)) {
+          migrated.bind_null(2);
+        } else {
+          migrated.bind(2, legacy.integer(1));
+        }
+        migrated.bind(3, legacy.integer(2));
+        migrated.bind(4, legacy.text(3));
+        migrated.bind(5, exposure_ev);
+        migrated.bind(6, graph);
+        migrated.bind(7, sha256(graph));
+        migrated.bind(8, kWorkingColorId);
+        migrated.done();
+        migrated.reset();
+      }
+    }
+    database.exec("DROP TABLE snapshots;");
+    database.exec("ALTER TABLE snapshots_v2 RENAME TO snapshots;");
+
+    set_meta(database, "format", kProjectFormatV2);
+    set_meta(database, "migration_source_format", kProjectFormatV1);
+    set_meta(
+        database, "migration_source_document_id",
+        get_meta(database, "document_id"));
+    set_meta(database, "migration_source_fingerprint", source_fingerprint);
+    set_meta_integer(database, "clean_shutdown", 1);
+    database.exec(
+        "PRAGMA user_version = " +
+        std::to_string(kProjectUserVersionV2) + ";");
+    if (migration_source_fingerprint(database, true) !=
+        source_fingerprint) {
+      throw_error(
+          "IO_MIGRATION_VERIFY",
+          "The migrated project facts do not match the validated source.");
+    }
+    database.exec("COMMIT;");
+  } catch (...) {
+    rollback_noexcept(database);
+    throw;
+  }
+  database.exec("PRAGMA foreign_keys = ON;");
+  check_database_integrity(database);
+  static_cast<void>(validate_database_format(
+      database, kProjectUserVersionV2));
+}
+
 }  // namespace
 
 struct ProjectStore::Impl {
@@ -748,16 +1849,22 @@ struct ProjectStore::Impl {
       std::filesystem::path root_value,
       std::unique_ptr<ProjectLock> lock_value,
       std::unique_ptr<Database> database_value,
-      bool recovered_value)
+      bool recovered_value,
+      int format_version_value,
+      bool read_only_value = false)
       : root(std::move(root_value)),
         lock(std::move(lock_value)),
         database(std::move(database_value)),
-        recovered_unclean_shutdown(recovered_value) {}
+        recovered_unclean_shutdown(recovered_value),
+        format_version(format_version_value),
+        read_only(read_only_value) {}
 
   std::filesystem::path root;
   std::unique_ptr<ProjectLock> lock;
   std::unique_ptr<Database> database;
   bool recovered_unclean_shutdown{};
+  int format_version{kProjectUserVersionV1};
+  bool read_only{};
 };
 
 ProjectStoreError::ProjectStoreError(std::string code, std::string message)
@@ -879,7 +1986,7 @@ ProjectStore ProjectStore::create(
         "snapshot_id INTEGER NOT NULL REFERENCES snapshots(id)"
         ") STRICT;");
 
-    set_meta(project_database, "format", "nps.project/v1");
+    set_meta(project_database, "format", kProjectFormatV1);
     set_meta(
         project_database,
         "document_id",
@@ -916,13 +2023,16 @@ ProjectStore ProjectStore::create(
         std::to_string(kProjectApplicationId) + ";");
     project_database.exec(
         "PRAGMA user_version = " +
-        std::to_string(kProjectUserVersion) + ";");
+        std::to_string(kProjectUserVersionV1) + ";");
     project_database.exec("COMMIT;");
   } catch (...) {
     rollback_noexcept(project_database);
     throw;
   }
 
+  static_cast<void>(validate_database_format(
+      project_database, kProjectUserVersionV1));
+  check_database_integrity(project_database);
   try {
     project_database.exec("PRAGMA wal_checkpoint(TRUNCATE);");
   } catch (...) {
@@ -948,47 +2058,32 @@ ProjectStore ProjectStore::open(
     const std::filesystem::path& project_root) {
   validate_project_root(project_root);
   std::error_code error;
-  const auto root_status = std::filesystem::symlink_status(project_root, error);
+  const std::filesystem::path resolved_root =
+      std::filesystem::absolute(project_root, error).lexically_normal();
+  if (error) {
+    throw_error("IO_PROJECT_PATH", "The project path could not be resolved.");
+  }
+  const auto root_status = std::filesystem::symlink_status(resolved_root, error);
   if (error || !std::filesystem::is_directory(root_status) ||
-      is_link_or_reparse_point(project_root, root_status)) {
+      is_link_or_reparse_point(resolved_root, root_status)) {
     throw_error("IO_PROJECT_OPEN", "The project directory is unavailable.");
   }
   const auto database_status =
-      std::filesystem::symlink_status(project_root / "project.db", error);
+      std::filesystem::symlink_status(resolved_root / "project.db", error);
   if (error || !std::filesystem::is_regular_file(database_status) ||
-      is_link_or_reparse_point(project_root / "project.db", database_status)) {
+      is_link_or_reparse_point(resolved_root / "project.db", database_status)) {
     throw_error("IO_DATABASE_OPEN", "The project database is unavailable.");
   }
 
   auto project_lock =
-      std::make_unique<ProjectLock>(project_root / "project.lock");
+      std::make_unique<ProjectLock>(resolved_root / "project.lock");
   auto database = std::make_unique<Database>(
-      project_root / "project.db",
+      resolved_root / "project.db",
       SQLITE_OPEN_READWRITE | SQLITE_OPEN_EXRESCODE |
           SQLITE_OPEN_NOFOLLOW);
   configure_database(*database);
 
-  {
-    Statement application_id(database->get(), "PRAGMA application_id;");
-    if (!application_id.row() ||
-        application_id.integer(0) != kProjectApplicationId) {
-      throw_error(
-          "IO_PROJECT_FORMAT",
-          "The project application identifier is invalid.");
-    }
-  }
-  {
-    Statement user_version(database->get(), "PRAGMA user_version;");
-    if (!user_version.row() ||
-        user_version.integer(0) != kProjectUserVersion) {
-      throw_error(
-          "IO_PROJECT_VERSION",
-          "The project format version is unsupported.");
-    }
-  }
-  if (get_meta(*database, "format") != "nps.project/v1") {
-    throw_error("IO_PROJECT_VERSION", "The project format version is unsupported.");
-  }
+  const int format_version = validate_database_format(*database);
 
   const std::int64_t clean_state =
       get_meta_integer(*database, "clean_shutdown");
@@ -1003,11 +2098,15 @@ ProjectStore ProjectStore::open(
   }
 
   auto implementation = std::make_unique<Impl>(
-      project_root,
+      resolved_root,
       std::move(project_lock),
       std::move(database),
-      recovered);
-  Database& project_database = *implementation->database;
+      recovered,
+      format_version);
+  ProjectStore project(std::move(implementation));
+  static_cast<void>(project.verify_integrity());
+
+  Database& project_database = *project.impl_->database;
   project_database.exec("BEGIN IMMEDIATE;");
   try {
     set_meta_integer(project_database, "clean_shutdown", 0);
@@ -1017,43 +2116,296 @@ ProjectStore ProjectStore::open(
     throw;
   }
 
-  ProjectStore project(std::move(implementation));
-  static_cast<void>(project.verify_integrity());
-  const std::filesystem::path create_marker =
-      project_root / ".nps-creating";
+  const bool is_v2 = format_version == kProjectUserVersionV2;
+  const std::filesystem::path publish_marker =
+      resolved_root / (is_v2 ? ".nps-migrating" : ".nps-creating");
+  const std::string expected_marker =
+      is_v2 ? "nps.migrate/v1-to-v2\n" : "nps.create/v1\n";
   const auto marker_status =
-      std::filesystem::symlink_status(create_marker, error);
+      std::filesystem::symlink_status(publish_marker, error);
   if (!error && std::filesystem::exists(marker_status)) {
     if (!std::filesystem::is_regular_file(marker_status) ||
-        is_link_or_reparse_point(create_marker, marker_status)) {
+        is_link_or_reparse_point(publish_marker, marker_status)) {
       throw_error(
           "IO_PROJECT_CREATE_MARKER",
-          "The project creation marker is invalid.");
+          "The project publication marker is invalid.");
     }
     {
-      std::ifstream marker(create_marker, std::ios::binary);
+      std::ifstream marker(publish_marker, std::ios::binary);
       const std::string marker_text{
           std::istreambuf_iterator<char>(marker),
           std::istreambuf_iterator<char>()};
-      if (!marker || marker_text != "nps.create/v1\n") {
+      if (!marker || marker_text != expected_marker) {
         throw_error(
             "IO_PROJECT_CREATE_MARKER",
-            "The project creation marker is invalid.");
+            "The project publication marker is invalid.");
       }
     }
     error.clear();
-    if (!std::filesystem::remove(create_marker, error) || error) {
+    if (!std::filesystem::remove(publish_marker, error) || error) {
       throw_error(
           "IO_PROJECT_FINALIZE",
-          "The recovered project marker could not be finalized.");
+          "The recovered project publication marker could not be finalized.");
     }
   } else if (error &&
              error != std::errc::no_such_file_or_directory) {
     throw_error(
         "IO_PROJECT_CREATE_MARKER",
-        "The project creation marker could not be inspected.");
+        "The project publication marker could not be inspected.");
   }
   return project;
+}
+
+ProjectStore ProjectStore::migrate_v1_to_v2(
+    const std::filesystem::path& source_root,
+    const std::filesystem::path& target_root,
+    FaultPoint fault_point) {
+  validate_project_root(source_root);
+  validate_project_root(target_root);
+
+  std::error_code error;
+  const std::filesystem::path resolved_source =
+      std::filesystem::absolute(source_root, error).lexically_normal();
+  if (error) {
+    throw_error(
+        "IO_PROJECT_PATH",
+        "The migration source path could not be resolved.");
+  }
+  const std::filesystem::path resolved_target =
+      std::filesystem::absolute(target_root, error).lexically_normal();
+  if (error) {
+    throw_error(
+        "IO_PROJECT_PATH",
+        "The migration target path could not be resolved.");
+  }
+  require_real_directory_ancestry(resolved_source.parent_path());
+  require_real_directory_ancestry(resolved_target.parent_path());
+  if (!std::filesystem::equivalent(
+          resolved_source.parent_path(),
+          resolved_target.parent_path(),
+          error) ||
+      error) {
+    throw_error(
+        "IO_MIGRATION_PATH",
+        "The migration target must share the source project parent directory.");
+  }
+
+  const auto source_status =
+      std::filesystem::symlink_status(resolved_source, error);
+  if (error || !std::filesystem::is_directory(source_status) ||
+      is_link_or_reparse_point(resolved_source, source_status)) {
+    throw_error(
+        "IO_PROJECT_OPEN",
+        "The migration source project is unavailable.");
+  }
+  const auto source_database_status = std::filesystem::symlink_status(
+      resolved_source / "project.db", error);
+  if (error || !std::filesystem::is_regular_file(source_database_status) ||
+      is_link_or_reparse_point(
+          resolved_source / "project.db", source_database_status)) {
+    throw_error(
+        "IO_DATABASE_OPEN",
+        "The migration source database is unavailable.");
+  }
+
+  auto source_lock =
+      std::make_unique<ProjectLock>(resolved_source / "project.lock");
+  auto source_database = std::make_unique<Database>(
+      resolved_source / "project.db",
+      SQLITE_OPEN_READONLY | SQLITE_OPEN_EXRESCODE |
+          SQLITE_OPEN_NOFOLLOW);
+  configure_read_only_database(*source_database);
+  static_cast<void>(validate_database_format(
+      *source_database, kProjectUserVersionV1));
+  const std::int64_t source_clean_state =
+      get_meta_integer(*source_database, "clean_shutdown");
+  if (source_clean_state != 0 && source_clean_state != 1) {
+    throw_error(
+        "IO_PROJECT_FORMAT",
+        "The source clean-shutdown marker is invalid.");
+  }
+  if (source_clean_state == 0) {
+    check_database_integrity(*source_database);
+  }
+
+  auto source_implementation = std::make_unique<Impl>(
+      resolved_source,
+      std::move(source_lock),
+      std::move(source_database),
+      source_clean_state == 0,
+      kProjectUserVersionV1,
+      true);
+  ProjectStore source(std::move(source_implementation));
+  static_cast<void>(source.verify_integrity());
+  validate_v1_migration_semantics(*source.impl_->database);
+  const std::string source_document_id = source.document_id();
+  const std::string source_fingerprint =
+      migration_source_fingerprint(*source.impl_->database);
+
+  const bool target_exists =
+      std::filesystem::exists(resolved_target, error);
+  if (error) {
+    throw_error(
+        "IO_PROJECT_STAT",
+        "The migration target could not be inspected.");
+  }
+  if (target_exists) {
+    try {
+      ProjectStore existing = ProjectStore::open(resolved_target);
+      const bool matches =
+          existing.project_format() == kProjectFormatV2 &&
+          existing.document_id() == source_document_id &&
+          get_meta(
+              *existing.impl_->database,
+              "migration_source_document_id") == source_document_id &&
+          get_meta(
+              *existing.impl_->database,
+              "migration_source_fingerprint") == source_fingerprint;
+      if (!matches) {
+        throw_error(
+            "IO_MIGRATION_TARGET_CONFLICT",
+            "The migration target belongs to a different source state.");
+      }
+      return existing;
+    } catch (const ProjectStoreError& target_error) {
+      if (target_error.code() == "IO_MIGRATION_TARGET_CONFLICT" ||
+          target_error.code() == "IO_PROJECT_LOCKED") {
+        throw;
+      }
+      throw_error(
+          "IO_MIGRATION_TARGET_CONFLICT",
+          "The existing migration target is not the expected complete v2 project.");
+    }
+  }
+
+  const std::filesystem::path staging_root =
+      resolved_target.parent_path() /
+      (random_identifier(".nps-migrating-") + ".npsproj");
+  const bool staging_created =
+      std::filesystem::create_directory(staging_root, error);
+  if (error || !staging_created) {
+    throw_error(
+        "IO_MIGRATION_CREATE",
+        "The private migration staging directory could not be reserved.");
+  }
+  OwnedStagingDirectory staging_cleanup(staging_root);
+  std::filesystem::create_directories(
+      staging_root / "objects" / "sha256", error);
+  if (error) {
+    throw_error(
+        "IO_MIGRATION_CREATE",
+        "The migration object directory could not be created.");
+  }
+  for (const std::string_view child :
+       {"previews", "recovery", "manifests"}) {
+    std::filesystem::create_directories(staging_root / child, error);
+    if (error) {
+      throw_error(
+          "IO_MIGRATION_CREATE",
+          "A migration project directory could not be created.");
+    }
+  }
+
+  {
+    Statement objects(
+        source.impl_->database->get(),
+        "SELECT hash FROM objects ORDER BY hash;");
+    while (objects.row()) {
+      const std::string expected_hash = objects.text(0);
+      validate_object_ancestry(resolved_source, expected_hash);
+      const std::vector<std::uint8_t> bytes =
+          read_file(object_path(resolved_source, expected_hash));
+      if (sha256(bytes) != expected_hash ||
+          persist_object(staging_root, bytes) != expected_hash) {
+        throw_error(
+            "IO_OBJECT_CORRUPT",
+            "A source object changed during migration.");
+      }
+    }
+  }
+
+  {
+    auto migrated_database = std::make_unique<Database>(
+        staging_root / "project.db",
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_EXRESCODE |
+            SQLITE_OPEN_NOFOLLOW);
+    backup_database(
+        *source.impl_->database, *migrated_database);
+    configure_database(*migrated_database);
+    static_cast<void>(validate_database_format(
+        *migrated_database, kProjectUserVersionV1));
+    if (migration_source_fingerprint(*migrated_database) !=
+        source_fingerprint) {
+      throw_error(
+          "IO_MIGRATION_SOURCE_CHANGED",
+          "The migration source changed after validation.");
+    }
+    transform_database_v1_to_v2(
+        *migrated_database, source_fingerprint);
+    try {
+      migrated_database->exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    } catch (...) {
+    }
+  }
+
+  {
+    ProjectStore staged = ProjectStore::open(staging_root);
+    if (staged.project_format() != kProjectFormatV2 ||
+        staged.document_id() != source_document_id ||
+        get_meta(
+            *staged.impl_->database,
+            "migration_source_fingerprint") != source_fingerprint ||
+        migration_source_fingerprint(
+            *staged.impl_->database, true) != source_fingerprint) {
+      throw_error(
+          "IO_MIGRATION_VERIFY",
+          "The staged v2 project does not match its source.");
+    }
+    static_cast<void>(staged.verify_integrity());
+    staged.close();
+  }
+  sync_file(staging_root / "project.db");
+  {
+    std::ofstream marker(
+        staging_root / ".nps-migrating",
+        std::ios::binary | std::ios::trunc);
+    marker << "nps.migrate/v1-to-v2\n";
+    marker.flush();
+    if (!marker) {
+      throw_error(
+          "IO_MIGRATION_CREATE",
+          "The migration publication marker could not be written.");
+    }
+  }
+  sync_file(staging_root / ".nps-migrating");
+  inject_crash_if_requested(
+      fault_point, FaultPoint::after_migration_staged);
+
+  if (std::filesystem::exists(resolved_target, error)) {
+    throw_error(
+        "IO_MIGRATION_TARGET_CONFLICT",
+        "Another process published the migration target first.");
+  }
+  if (error) {
+    throw_error(
+        "IO_PROJECT_STAT",
+        "The migration target could not be inspected before publication.");
+  }
+  std::filesystem::rename(staging_root, resolved_target, error);
+  if (error) {
+    if (std::filesystem::exists(resolved_target)) {
+      throw_error(
+          "IO_MIGRATION_TARGET_CONFLICT",
+          "Another process published the migration target first.");
+    }
+    throw_error(
+        "IO_MIGRATION_PUBLISH",
+        "The completed v2 project could not be published atomically.");
+  }
+  staging_cleanup.release_after_publish();
+  inject_crash_if_requested(
+      fault_point, FaultPoint::after_migration_published);
+  return ProjectStore::open(resolved_target);
 }
 
 ProjectStore::ProjectStore(ProjectStore&&) noexcept = default;
@@ -1083,6 +2435,15 @@ std::string ProjectStore::document_id() const {
   return get_meta(*impl_->database, "document_id");
 }
 
+std::string ProjectStore::project_format() const {
+  if (!impl_) {
+    throw_error("IO_PROJECT_CLOSED", "The project is closed.");
+  }
+  return impl_->format_version == kProjectUserVersionV2
+             ? std::string(kProjectFormatV2)
+             : std::string(kProjectFormatV1);
+}
+
 std::int64_t ProjectStore::current_revision() const {
   if (!impl_) {
     throw_error("IO_PROJECT_CLOSED", "The project is closed.");
@@ -1096,7 +2457,8 @@ Snapshot ProjectStore::current_snapshot() const {
   }
   return read_snapshot(
       *impl_->database,
-      get_meta_integer(*impl_->database, "current_snapshot_id"));
+      get_meta_integer(*impl_->database, "current_snapshot_id"),
+      impl_->format_version);
 }
 
 std::vector<std::uint8_t> ProjectStore::read_source_bytes() const {
@@ -1116,6 +2478,8 @@ IntegrityReport ProjectStore::verify_integrity() const {
   if (!impl_) {
     throw_error("IO_PROJECT_CLOSED", "The project is closed.");
   }
+  static_cast<void>(validate_database_format(
+      *impl_->database, impl_->format_version));
   check_database_integrity(*impl_->database);
 
   const std::int64_t revision =
@@ -1127,7 +2491,30 @@ IntegrityReport ProjectStore::verify_integrity() const {
   if (revision < 0 || history_position < 0) {
     throw_error("IO_PROJECT_FORMAT", "Project revision metadata is invalid.");
   }
-  static_cast<void>(read_snapshot(*impl_->database, current_snapshot_id));
+  static_cast<void>(read_snapshot(
+      *impl_->database, current_snapshot_id, impl_->format_version));
+  if (impl_->format_version == kProjectUserVersionV2) {
+    Statement snapshots(
+        impl_->database->get(), "SELECT id FROM snapshots ORDER BY id;");
+    std::size_t snapshot_count = 0U;
+    while (snapshots.row()) {
+      static_cast<void>(read_snapshot(
+          *impl_->database,
+          snapshots.integer(0),
+          impl_->format_version));
+      ++snapshot_count;
+    }
+    if (snapshot_count == 0U ||
+        get_meta(*impl_->database, "migration_source_format") !=
+            kProjectFormatV1 ||
+        get_meta(*impl_->database, "migration_source_document_id").empty() ||
+        !is_lower_hex(
+            get_meta(*impl_->database, "migration_source_fingerprint"))) {
+      throw_error(
+          "IO_PROJECT_FORMAT",
+          "The v2 migration provenance is invalid.");
+    }
+  }
   if (history_snapshot(*impl_->database, history_position) !=
       current_snapshot_id) {
     throw_error(
@@ -1282,6 +2669,21 @@ CommitResult ProjectStore::execute(
        command.exposure_delta_ev > 10.0)) {
     throw_error("CMD_SCHEMA_INVALID", "The exposure value is outside the M0 range.");
   }
+  if (command.mutation == StoreMutation::replace_graph) {
+    if (impl_->format_version != kProjectUserVersionV2) {
+      throw_error(
+          "IO_PROJECT_MIGRATION_REQUIRED",
+          "graph.replace requires an explicit migration to nps.project/v2.");
+    }
+    if (!is_lower_hex(command.edit_graph_sha256) ||
+        sha256(command.edit_graph_json) != command.edit_graph_sha256 ||
+        !validate_canonical_edit_graph(
+            command.edit_graph_json, command.working_color_id)) {
+      throw_error(
+          "CMD_SCHEMA_INVALID",
+          "The replacement edit graph is not canonical or valid.");
+    }
+  }
 
   Database& database = *impl_->database;
   bool commit_requested = false;
@@ -1326,7 +2728,8 @@ CommitResult ProjectStore::execute(
           .command_id = replay_record->command_id,
           .base_revision = replay_record->base_revision,
           .new_revision = replay_record->new_revision,
-          .snapshot = read_snapshot(database, replay_record->snapshot_id),
+          .snapshot = read_snapshot(
+              database, replay_record->snapshot_id, impl_->format_version),
           .idempotent_replay = true};
       database.exec("ROLLBACK;");
       return result;
@@ -1353,24 +2756,65 @@ CommitResult ProjectStore::execute(
     std::int64_t snapshot_id =
         get_meta_integer(database, "current_snapshot_id");
 
-    if (command.mutation == StoreMutation::adjust_exposure) {
-      const Snapshot current = read_snapshot(database, snapshot_id);
+    if (command.mutation == StoreMutation::adjust_exposure ||
+        command.mutation == StoreMutation::replace_graph) {
+      const Snapshot current =
+          read_snapshot(database, snapshot_id, impl_->format_version);
       const double exposure_ev =
-          current.exposure_ev + command.exposure_delta_ev;
+          command.mutation == StoreMutation::adjust_exposure
+              ? current.exposure_ev + command.exposure_delta_ev
+              : current.exposure_ev;
       if (!std::isfinite(exposure_ev)) {
         throw_error("CMD_SCHEMA_INVALID", "The resulting exposure is invalid.");
       }
 
-      Statement snapshot_insert(
-          database.get(),
-          "INSERT INTO snapshots("
-          "parent_snapshot_id, created_revision, source_hash, exposure_ev"
-          ") VALUES(?1, ?2, ?3, ?4);");
-      snapshot_insert.bind(1, current.id);
-      snapshot_insert.bind(2, new_revision);
-      snapshot_insert.bind(3, current.source_hash);
-      snapshot_insert.bind(4, exposure_ev);
-      snapshot_insert.done();
+      if (impl_->format_version == kProjectUserVersionV2) {
+        std::string edit_graph_json = command.edit_graph_json;
+        std::string edit_graph_hash = command.edit_graph_sha256;
+        std::string working_color_id = command.working_color_id;
+        if (command.mutation == StoreMutation::adjust_exposure) {
+          const std::string revision_text = std::to_string(new_revision);
+          edit_graph_json = append_exposure_to_graph(
+              current.edit_graph_json,
+              "graph-revision-" + revision_text,
+              "adjust-exposure-revision-" + revision_text,
+              command.exposure_delta_ev);
+          edit_graph_hash = sha256(edit_graph_json);
+          working_color_id = current.working_color_id;
+        }
+        if (!validate_canonical_edit_graph(
+                edit_graph_json, working_color_id) ||
+            sha256(edit_graph_json) != edit_graph_hash) {
+          throw_error(
+              "IO_PROJECT_FORMAT",
+              "The new snapshot edit graph is invalid.");
+        }
+        Statement snapshot_insert(
+            database.get(),
+            "INSERT INTO snapshots("
+            "parent_snapshot_id, created_revision, source_hash, exposure_ev, "
+            "edit_graph_json, edit_graph_sha256, working_color_id"
+            ") VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7);");
+        snapshot_insert.bind(1, current.id);
+        snapshot_insert.bind(2, new_revision);
+        snapshot_insert.bind(3, current.source_hash);
+        snapshot_insert.bind(4, exposure_ev);
+        snapshot_insert.bind(5, edit_graph_json);
+        snapshot_insert.bind(6, edit_graph_hash);
+        snapshot_insert.bind(7, working_color_id);
+        snapshot_insert.done();
+      } else {
+        Statement snapshot_insert(
+            database.get(),
+            "INSERT INTO snapshots("
+            "parent_snapshot_id, created_revision, source_hash, exposure_ev"
+            ") VALUES(?1, ?2, ?3, ?4);");
+        snapshot_insert.bind(1, current.id);
+        snapshot_insert.bind(2, new_revision);
+        snapshot_insert.bind(3, current.source_hash);
+        snapshot_insert.bind(4, exposure_ev);
+        snapshot_insert.done();
+      }
       snapshot_id = sqlite3_last_insert_rowid(database.get());
 
       Statement truncate_history(
@@ -1442,7 +2886,8 @@ CommitResult ProjectStore::execute(
         .command_id = command.command_id,
         .base_revision = base_revision,
         .new_revision = new_revision,
-        .snapshot = read_snapshot(database, snapshot_id),
+        .snapshot =
+            read_snapshot(database, snapshot_id, impl_->format_version),
         .idempotent_replay = false};
     commit_requested = true;
     database.exec("COMMIT;");
@@ -1469,6 +2914,9 @@ void ProjectStore::close() {
     return;
   }
   auto closing = std::move(impl_);
+  if (closing->read_only) {
+    return;
+  }
   Database& database = *closing->database;
   database.exec("BEGIN IMMEDIATE;");
   try {

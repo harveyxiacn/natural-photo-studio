@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -8,17 +9,23 @@
 
 #include <nlohmann/json.hpp>
 
+#include "nps/document/edit_graph.hpp"
+
 namespace nps::core {
 
 inline constexpr std::string_view kCommandSchema = "nps.command/v1";
 inline constexpr std::uint64_t kMaxJsonSafeRevision = 9'007'199'254'740'991ULL;
 inline constexpr double kMinExposureEv = -10.0;
 inline constexpr double kMaxExposureEv = 10.0;
+inline constexpr std::size_t kMaximumCommandJsonBytes =
+    document::kMaximumEditGraphJsonBytes + 64U * 1024U;
+inline constexpr std::size_t kMaximumCommandJsonNestingDepth = 64U;
 
 enum class CommandKind {
     AdjustExposure,
     HistoryUndo,
     HistoryRedo,
+    GraphReplace,
 };
 
 [[nodiscard]] std::string_view to_string(CommandKind kind) noexcept;
@@ -35,8 +42,19 @@ struct HistoryParameters {
     [[nodiscard]] bool operator==(const HistoryParameters&) const = default;
 };
 
+struct GraphReplaceParameters {
+    document::EditGraph graph;
+    std::string graph_hash;
+
+    [[nodiscard]] bool operator==(const GraphReplaceParameters&) const =
+        default;
+};
+
 using CommandParameters =
-    std::variant<AdjustExposureParameters, HistoryParameters>;
+    std::variant<
+        AdjustExposureParameters,
+        HistoryParameters,
+        GraphReplaceParameters>;
 
 enum class DataAccessPolicy {
     Deny,
@@ -81,8 +99,8 @@ struct CommandError {
 
 using CommandParseResult = std::variant<Command, CommandError>;
 
-// Parses and validates the strict M0 subset of nps.command/v1. No unknown
-// properties are accepted at any object level.
+// Parses and validates the strict supported subset of nps.command/v1. No
+// unknown or duplicate properties are accepted at any object level.
 [[nodiscard]] CommandParseResult parse_command_json(std::string_view json_text);
 
 // Validates commands constructed by C++ callers against the same invariants.
