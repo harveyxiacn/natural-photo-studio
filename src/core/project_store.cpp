@@ -473,7 +473,7 @@ class OwnedStagingDirectory final {
 
 class Statement final {
  public:
-  Statement(sqlite3* database, std::string_view sql) : database_(database) {
+  Statement(sqlite3* database, std::string_view sql) {
     const int result = sqlite3_prepare_v3(
         database,
         sql.data(),
@@ -576,7 +576,6 @@ class Statement final {
   }
 
  private:
-  sqlite3* database_{};
   sqlite3_stmt* statement_{};
 };
 
@@ -1375,7 +1374,10 @@ void set_meta_integer(
       .id = statement.integer(0),
       .created_revision = statement.integer(1),
       .source_hash = statement.text(2),
-      .exposure_ev = statement.real(3)};
+      .exposure_ev = statement.real(3),
+      .edit_graph_json = {},
+      .edit_graph_sha256 = {},
+      .working_color_id = {}};
   if (format_version == kProjectUserVersionV2) {
     snapshot.edit_graph_json = statement.text(4);
     snapshot.edit_graph_sha256 = statement.text(5);

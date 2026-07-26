@@ -250,6 +250,8 @@ class JoiningThreadGroup final {
       .maximum_output_bytes =
           static_cast<std::size_t>(source.width) * source.height *
           ImageF32::channel_count * sizeof(float),
+      .maximum_transient_bytes =
+          static_cast<std::size_t>(512) * 1024U * 1024U,
   };
 }
 

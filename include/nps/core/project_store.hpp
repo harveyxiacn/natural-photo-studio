@@ -32,9 +32,9 @@ struct StoreCommand {
   std::int64_t expected_revision{};
   StoreMutation mutation{StoreMutation::adjust_exposure};
   double exposure_delta_ev{};
-  std::string edit_graph_json;
-  std::string edit_graph_sha256;
-  std::string working_color_id;
+  std::string edit_graph_json{};
+  std::string edit_graph_sha256{};
+  std::string working_color_id{};
 };
 
 struct Snapshot {
@@ -44,9 +44,9 @@ struct Snapshot {
   double exposure_ev{};
   // Empty for nps.project/v1. nps.project/v2 stores the complete canonical
   // immutable graph and its explicit color contract on every snapshot.
-  std::string edit_graph_json;
-  std::string edit_graph_sha256;
-  std::string working_color_id;
+  std::string edit_graph_json{};
+  std::string edit_graph_sha256{};
+  std::string working_color_id{};
 };
 
 struct CommitResult {
