@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_COMMIT: 40f3c709db80acf154ac4b17a1f83c564ebd022e
+  VCPKG_DISABLE_METRICS: "1"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_LINUX_X64_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  policy:
+    name: Public-source policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install policy-check dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run public-source policy checks
+        run: npm run check:policy
+
+      - name: Run pinned Gitleaks history scan
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$GITLEAKS_LINUX_X64_SHA256" "$archive" \
+            | sha256sum --check -
+          tar --extract --gzip --file "$archive" \
+            --directory "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git \
+            --config .gitleaks.toml \
+            --no-banner \
+            --redact
+
+  core:
+    name: Core (${{ matrix.os }}, ${{ matrix.preset }})
+    needs: policy
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            preset: dev
+            configuration: Debug
+          - os: windows-latest
+            preset: release
+            configuration: Release
+          - os: macos-latest
+            preset: dev
+            configuration: Debug
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      VCPKG_ROOT: ${{ github.workspace }}/.tools/vcpkg
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Fetch pinned vcpkg
+        shell: bash
+        run: |
+          mkdir -p .tools
+          git clone --filter=blob:none --no-checkout --depth 1 \
+            https://github.com/microsoft/vcpkg.git .tools/vcpkg
+          git -C .tools/vcpkg fetch --depth 1 origin "$VCPKG_COMMIT"
+          git -C .tools/vcpkg checkout --detach "$VCPKG_COMMIT"
+
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\.tools\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Bootstrap vcpkg (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./.tools/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Configure, build, and test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installPath) {
+            throw "A Visual Studio installation with the C++ toolchain was not found."
+          }
+          Import-Module (Join-Path $installPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $installPath -SkipAutomaticLocation `
+            -DevCmdArguments "-arch=x64 -host_arch=x64"
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }}
+          ctest --preset ${{ matrix.preset }}
+
+      - name: Configure, build, and test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cmake --preset "${{ matrix.preset }}"
+          cmake --build --preset "${{ matrix.preset }}"
+          ctest --preset "${{ matrix.preset }}"
+
+      - name: Install and smoke-test staged CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP "nps-install"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "nps-smoke"
+          New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+          cmake --install "build/${{ matrix.preset }}" `
+            --config "${{ matrix.configuration }}" `
+            --prefix $installRoot
+
+          $cli = Join-Path $installRoot "bin\nps-cli.exe"
+          $noticeRoot = Join-Path $installRoot "share\natural-photo-studio"
+          foreach ($requiredPath in @(
+            $cli,
+            (Join-Path $noticeRoot "LICENSE"),
+            (Join-Path $noticeRoot "NOTICE"),
+            (Join-Path $noticeRoot "THIRD_PARTY_NOTICES.md"),
+            (Join-Path $installRoot "bin\sqlite3.dll")
+          )) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Required installed file is missing: $requiredPath"
+            }
+          }
+          if (-not (Get-ChildItem -LiteralPath (Join-Path $installRoot "bin") `
+            -Filter "libcrypto-*.dll" -File)) {
+            throw "The installed OpenSSL Crypto runtime DLL is missing."
+          }
+
+          Push-Location $smokeRoot
+          try {
+            & $cli demo (Join-Path $smokeRoot "demo.npsproj")
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed nps-cli demo failed with exit code $LASTEXITCODE."
+            }
+            & $cli verify (Join-Path $smokeRoot "demo.npsproj")
+            if ($LASTEXITCODE -ne 0) {
+              throw "Installed nps-cli verify failed with exit code $LASTEXITCODE."
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Install and smoke-test staged CLI (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          install_root="$RUNNER_TEMP/nps-install"
+          smoke_root="$RUNNER_TEMP/nps-smoke"
+          mkdir -p "$smoke_root"
+          cmake --install "build/${{ matrix.preset }}" \
+            --config "${{ matrix.configuration }}" \
+            --prefix "$install_root"
+
+          cli="$install_root/bin/nps-cli"
+          notice_root="$install_root/share/natural-photo-studio"
+          test -x "$cli"
+          test -f "$notice_root/LICENSE"
+          test -f "$notice_root/NOTICE"
+          test -f "$notice_root/THIRD_PARTY_NOTICES.md"
+
+          cd "$smoke_root"
+          "$cli" demo "$smoke_root/demo.npsproj"
+          "$cli" verify "$smoke_root/demo.npsproj"

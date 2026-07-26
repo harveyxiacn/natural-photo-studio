@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:natural-photo-studio:schema:nps.command:v1",
+  "title": "Natural Photo Studio M0 command envelope",
+  "description": "Strict M0 subset of nps.command/v1. Every object rejects unknown properties.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/adjustExposureCommand"
+    },
+    {
+      "$ref": "#/$defs/historyUndoCommand"
+    },
+    {
+      "$ref": "#/$defs/historyRedoCommand"
+    }
+  ],
+  "$defs": {
+    "commandId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+    },
+    "documentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "expectedRevision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "privacy": {
+      "type": "object",
+      "required": [
+        "network",
+        "cloudInference"
+      ],
+      "properties": {
+        "network": {
+          "const": "deny"
+        },
+        "cloudInference": {
+          "const": "deny"
+        }
+      },
+      "additionalProperties": false
+    },
+    "adjustExposureParams": {
+      "type": "object",
+      "required": [
+        "ev"
+      ],
+      "properties": {
+        "ev": {
+          "type": "number",
+          "minimum": -10,
+          "maximum": 10
+        }
+      },
+      "additionalProperties": false
+    },
+    "historyParams": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "adjustExposureCommand": {
+      "type": "object",
+      "required": [
+        "schema",
+        "commandId",
+        "idempotencyKey",
+        "documentId",
+        "expectedRevision",
+        "kind",
+        "params",
+        "privacy"
+      ],
+      "properties": {
+        "schema": {
+          "const": "nps.command/v1"
+        },
+        "commandId": {
+          "$ref": "#/$defs/commandId"
+        },
+        "idempotencyKey": {
+          "$ref": "#/$defs/idempotencyKey"
+        },
+        "documentId": {
+          "$ref": "#/$defs/documentId"
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/expectedRevision"
+        },
+        "kind": {
+          "const": "adjust.exposure"
+        },
+        "params": {
+          "$ref": "#/$defs/adjustExposureParams"
+        },
+        "privacy": {
+          "$ref": "#/$defs/privacy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "historyUndoCommand": {
+      "type": "object",
+      "required": [
+        "schema",
+        "commandId",
+        "idempotencyKey",
+        "documentId",
+        "expectedRevision",
+        "kind",
+        "params",
+        "privacy"
+      ],
+      "properties": {
+        "schema": {
+          "const": "nps.command/v1"
+        },
+        "commandId": {
+          "$ref": "#/$defs/commandId"
+        },
+        "idempotencyKey": {
+          "$ref": "#/$defs/idempotencyKey"
+        },
+        "documentId": {
+          "$ref": "#/$defs/documentId"
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/expectedRevision"
+        },
+        "kind": {
+          "const": "history.undo"
+        },
+        "params": {
+          "$ref": "#/$defs/historyParams"
+        },
+        "privacy": {
+          "$ref": "#/$defs/privacy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "historyRedoCommand": {
+      "type": "object",
+      "required": [
+        "schema",
+        "commandId",
+        "idempotencyKey",
+        "documentId",
+        "expectedRevision",
+        "kind",
+        "params",
+        "privacy"
+      ],
+      "properties": {
+        "schema": {
+          "const": "nps.command/v1"
+        },
+        "commandId": {
+          "$ref": "#/$defs/commandId"
+        },
+        "idempotencyKey": {
+          "$ref": "#/$defs/idempotencyKey"
+        },
+        "documentId": {
+          "$ref": "#/$defs/documentId"
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/expectedRevision"
+        },
+        "kind": {
+          "const": "history.redo"
+        },
+        "params": {
+          "$ref": "#/$defs/historyParams"
+        },
+        "privacy": {
+          "$ref": "#/$defs/privacy"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

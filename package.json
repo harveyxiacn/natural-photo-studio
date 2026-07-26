@@ -1,0 +1,22 @@
+{
+  "name": "natural-photo-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first, non-destructive professional photo editor.",
+  "type": "module",
+  "scripts": {
+    "check": "npm run check:policy",
+    "check:policy": "npm run check:text && npm run check:docs && npm run check:public && npm run test:policy",
+    "check:docs": "node scripts/check-doc-links.mjs",
+    "check:public": "node scripts/check-public-safety.mjs",
+    "check:text": "node scripts/check-text.mjs",
+    "test": "npm run test:policy",
+    "test:policy": "node --test scripts/check-public-safety.test.mjs",
+    "test:coverage": "node --test --experimental-test-coverage scripts/check-public-safety.test.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "packageManager": "npm@11.12.1",
+  "license": "Apache-2.0"
+}

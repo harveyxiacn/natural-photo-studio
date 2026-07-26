@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "natural-photo-studio",
+  "version-semver": "0.1.0",
+  "builtin-baseline": "40f3c709db80acf154ac4b17a1f83c564ebd022e",
+  "dependencies": [
+    "nlohmann-json",
+    "openssl",
+    "sqlite3",
+    "catch2"
+  ]
+}

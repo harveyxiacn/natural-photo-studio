@@ -1,0 +1,4 @@
+title = "Natural Photo Studio secret-scanning policy"
+
+[extend]
+useDefault = true
