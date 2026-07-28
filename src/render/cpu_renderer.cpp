@@ -856,14 +856,15 @@ struct CpuTileCache::Impl final {
       recency.pop_front();
       throw;
     }
-    resident_bytes += accounted_bytes;
-
-    while (resident_bytes > capacity_bytes && !recency.empty()) {
+    // Make room before addition so a near-size_t-maximum capacity cannot let
+    // unsigned wraparound bypass the byte-budget invariant.
+    while (accounted_bytes > capacity_bytes - resident_bytes) {
       const Entry& victim = recency.back();
       resident_bytes -= victim.accounted_bytes;
       entries.erase(std::string_view{victim.key});
       recency.pop_back();
     }
+    resident_bytes += accounted_bytes;
   }
 
   [[nodiscard]] TileCacheStats stats() const {

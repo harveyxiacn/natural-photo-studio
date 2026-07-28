@@ -1239,24 +1239,45 @@ TEST_CASE(
       make_graph({exposure_node("exposure", 0.5)});
   constexpr std::size_t bytes_per_tile =
       2U * 2U * ImageF32::channel_count * sizeof(float);
-  constexpr std::size_t cache_capacity = 1024U;
-  auto cache = std::make_shared<CpuTileCache>(cache_capacity);
-  const CpuRenderer renderer{cache};
+  constexpr std::size_t tiles_per_render = 2U;
   RenderRequest request = request_for(source, 2U, 2U);
-
-  const auto render = [&](const RenderRequest& candidate) {
-    return renderer.render(
+  const auto render_with = [&](
+                               const CpuRenderer& candidate_renderer,
+                               const RenderRequest& candidate_request) {
+    return candidate_renderer.render(
         source,
         graph,
         std::span<const MaskAssetView>{},
-        candidate);
+        candidate_request);
+  };
+
+  // Calibrate the subject budget from this standard-library ABI's own
+  // conservative accounting. The product contract is a byte budget, not a
+  // fixed number of entries for an arbitrary numeric capacity.
+  auto accounting_probe = std::make_shared<CpuTileCache>(
+      std::numeric_limits<std::size_t>::max());
+  const CpuRenderer probe_renderer{accounting_probe};
+  const RenderResult probe_cold = render_with(probe_renderer, request);
+  REQUIRE(probe_cold.diagnostics.rendered_tiles == tiles_per_render);
+  REQUIRE(probe_cold.diagnostics.cache_hits == 0U);
+  REQUIRE(probe_cold.diagnostics.cache_misses == tiles_per_render);
+  const auto probe_stats = accounting_probe->stats();
+  REQUIRE(probe_stats.entry_count == tiles_per_render);
+  REQUIRE(
+      probe_stats.resident_bytes > tiles_per_render * bytes_per_tile);
+  const std::size_t cache_capacity = probe_stats.resident_bytes;
+
+  auto cache = std::make_shared<CpuTileCache>(cache_capacity);
+  const CpuRenderer renderer{cache};
+  const auto render = [&](const RenderRequest& candidate) {
+    return render_with(renderer, candidate);
   };
 
   const RenderResult cold = render(request);
+  CHECK(cold.image == probe_cold.image);
   CHECK(cold.diagnostics.rendered_tiles == 2U);
   CHECK(cold.diagnostics.cache_hits == 0U);
   CHECK(cold.diagnostics.cache_misses == 2U);
-  CHECK(cache->stats().entry_count == 2U);
   CHECK(cache->stats().resident_bytes > 2U * bytes_per_tile);
   CHECK(cache->stats().resident_bytes <= cache_capacity);
   CHECK(cache->stats().capacity_bytes == cache_capacity);
@@ -1267,15 +1288,33 @@ TEST_CASE(
   CHECK(hot.diagnostics.cache_hits == 2U);
   CHECK(hot.diagnostics.cache_misses == 0U);
 
-  RenderRequest another_snapshot = request;
-  another_snapshot.snapshot_id = "snapshot-18";
-  const RenderResult isolated = render(another_snapshot);
+  RenderRequest isolated_request = request;
+  isolated_request.snapshot_id = "cache-pressure";
+  const RenderResult isolated = render(isolated_request);
   CHECK(isolated.image == cold.image);
-  CHECK(isolated.diagnostics.rendered_tiles == 2U);
+  CHECK(isolated.diagnostics.rendered_tiles == tiles_per_render);
   CHECK(isolated.diagnostics.cache_hits == 0U);
-  CHECK(isolated.diagnostics.cache_misses == 2U);
-  CHECK(cache->stats().entry_count <= 2U);
-  CHECK(cache->stats().resident_bytes <= cache->stats().capacity_bytes);
+  CHECK(isolated.diagnostics.cache_misses == tiles_per_render);
+  const RenderResult isolated_hot = render(isolated_request);
+  CHECK(isolated_hot.image == isolated.image);
+  CHECK(isolated_hot.diagnostics.rendered_tiles == 0U);
+  CHECK(isolated_hot.diagnostics.cache_hits == tiles_per_render);
+  CHECK(isolated_hot.diagnostics.cache_misses == 0U);
+
+  const auto pressured_stats = cache->stats();
+  CHECK(
+      pressured_stats.resident_bytes <= pressured_stats.capacity_bytes);
+
+  // The calibrated budget held exactly one two-tile identity before the
+  // isolated identity arrived. A fully cold baseline behaviorally proves
+  // that bounded LRU pressure evicted both original tile keys.
+  const RenderResult evicted_baseline = render(request);
+  CHECK(evicted_baseline.image == cold.image);
+  CHECK(evicted_baseline.diagnostics.rendered_tiles == tiles_per_render);
+  CHECK(evicted_baseline.diagnostics.cache_hits == 0U);
+  CHECK(evicted_baseline.diagnostics.cache_misses == tiles_per_render);
+  CHECK(cache->stats().resident_bytes <=
+        cache->stats().capacity_bytes);
 
   cache->clear();
   CHECK(cache->stats().entry_count == 0U);

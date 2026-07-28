@@ -76,6 +76,15 @@ class ProjectStoreError final : public std::runtime_error {
 
 class ProjectStore final {
  public:
+  // Project paths are captured as absolute identities before the store is
+  // returned. On POSIX, only the existing parent is canonicalized so benign
+  // system aliases are accepted without following the final .npsproj
+  // component. The final project directory and project.db must remain real
+  // filesystem objects; symbolic links and Windows reparse points are
+  // rejected, and SQLite database opens retain SQLITE_OPEN_NOFOLLOW.
+  //
+  // These checks reduce accidental link traversal but do not form a sandbox
+  // against an equal-privilege process replacing path entries concurrently.
   static ProjectStore create(
       const std::filesystem::path& project_root,
       std::span<const std::uint8_t> source_bytes,

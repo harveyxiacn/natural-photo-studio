@@ -441,23 +441,286 @@ TEST_CASE("clean close and reopen retain the committed project") {
   CHECK_FALSE(integrity.recovered_unclean_shutdown);
 }
 
-TEST_CASE("a project opened by relative path remains usable after cwd changes") {
+TEST_CASE("relative project operations remain usable after cwd changes") {
   TemporaryProjectRoot temporary;
-  const auto project_path = temporary.project();
   const auto source = make_source_bytes();
-  {
-    auto created = ProjectStore::create(project_path, source);
-    created.close();
-  }
-
   const auto unrelated = temporary.path() / "unrelated";
   REQUIRE(std::filesystem::create_directory(unrelated));
-  ScopedCurrentPath current_path(temporary.path());
-  auto reopened = ProjectStore::open("test.npsproj");
-  std::filesystem::current_path(unrelated);
 
-  CHECK(reopened.read_source_bytes() == source);
-  CHECK(reopened.verify_integrity().referenced_objects == 1);
+  SECTION("create captures an absolute project identity") {
+    ScopedCurrentPath current_path(temporary.path());
+    auto created =
+        ProjectStore::create("created-relative.npsproj", source);
+    std::filesystem::current_path(unrelated);
+
+    CHECK(created.read_source_bytes() == source);
+    CHECK(created.verify_integrity().referenced_objects == 1);
+  }
+
+  SECTION("open captures an absolute project identity") {
+    const auto project_path = temporary.project("opened-relative.npsproj");
+    {
+      auto created = ProjectStore::create(project_path, source);
+      created.close();
+    }
+    ScopedCurrentPath current_path(temporary.path());
+    auto reopened = ProjectStore::open("opened-relative.npsproj");
+    std::filesystem::current_path(unrelated);
+
+    CHECK(reopened.read_source_bytes() == source);
+    CHECK(reopened.verify_integrity().referenced_objects == 1);
+  }
+
+  SECTION("migration captures absolute source and target identities") {
+    const auto source_path = temporary.project("legacy-relative.npsproj");
+    {
+      auto source_project = ProjectStore::create(source_path, source);
+      source_project.close();
+    }
+    ScopedCurrentPath current_path(temporary.path());
+    auto migrated = ProjectStore::migrate_v1_to_v2(
+        "legacy-relative.npsproj",
+        "migrated-relative.npsproj");
+    std::filesystem::current_path(unrelated);
+
+    CHECK(migrated.project_format() == "nps.project/v2");
+    CHECK(migrated.read_source_bytes() == source);
+    CHECK(migrated.verify_integrity().referenced_objects == 1);
+  }
+}
+
+TEST_CASE(
+    "POSIX parent aliases are canonicalized before project operations") {
+  TemporaryProjectRoot temporary;
+  const auto real_parent = temporary.path() / "real-parent";
+  const auto alias_parent = temporary.path() / "parent-alias";
+  REQUIRE(std::filesystem::create_directory(real_parent));
+
+  std::error_code link_error;
+  std::filesystem::create_directory_symlink(
+      real_parent, alias_parent, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "Directory symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+
+  require_store_error("IO_OBJECT_LINK", [&] {
+    static_cast<void>(ProjectStore::create(
+        alias_parent / "legacy.npsproj", make_source_bytes()));
+  });
+#else
+  REQUIRE_FALSE(link_error);
+  const auto source_bytes = make_source_bytes(29, 13);
+  const auto alias_source = alias_parent / "legacy.npsproj";
+  const auto real_source = real_parent / "legacy.npsproj";
+  const auto alias_target = alias_parent / "migrated.npsproj";
+  const auto real_target = real_parent / "migrated.npsproj";
+  const auto retarget_parent = temporary.path() / "retarget-parent";
+  REQUIRE(std::filesystem::create_directory(retarget_parent));
+
+  {
+    auto created = ProjectStore::create(alias_source, source_bytes);
+    CHECK(created.read_source_bytes() == source_bytes);
+    created.close();
+  }
+  REQUIRE(std::filesystem::equivalent(alias_source, real_source));
+
+  {
+    auto reopened = ProjectStore::open(alias_source);
+    CHECK(reopened.project_format() == "nps.project/v1");
+    CHECK(reopened.read_source_bytes() == source_bytes);
+
+    link_error.clear();
+    REQUIRE(std::filesystem::remove(alias_parent, link_error));
+    REQUIRE_FALSE(link_error);
+    std::filesystem::create_directory_symlink(
+        retarget_parent, alias_parent, link_error);
+    REQUIRE_FALSE(link_error);
+    CHECK(reopened.read_source_bytes() == source_bytes);
+    CHECK(reopened.verify_integrity().referenced_objects == 1);
+    reopened.close();
+
+    link_error.clear();
+    REQUIRE(std::filesystem::remove(alias_parent, link_error));
+    REQUIRE_FALSE(link_error);
+    std::filesystem::create_directory_symlink(
+        real_parent, alias_parent, link_error);
+    REQUIRE_FALSE(link_error);
+  }
+
+  auto migrated =
+      ProjectStore::migrate_v1_to_v2(alias_source, alias_target);
+  CHECK(migrated.project_format() == "nps.project/v2");
+  CHECK(migrated.read_source_bytes() == source_bytes);
+  CHECK(migrated.verify_integrity().referenced_objects == 1);
+  REQUIRE(std::filesystem::equivalent(alias_target, real_target));
+  migrated.close();
+
+  const auto semantic_parent = real_parent / "semantic-parent";
+  const auto semantic_nested = semantic_parent / "nested";
+  const auto semantic_alias = temporary.path() / "semantic-alias";
+  REQUIRE(std::filesystem::create_directories(semantic_nested));
+  link_error.clear();
+  std::filesystem::create_directory_symlink(
+      semantic_nested, semantic_alias, link_error);
+  REQUIRE_FALSE(link_error);
+
+  const auto semantic_source =
+      semantic_alias / ".." / "semantic-source.npsproj";
+  const auto expected_semantic_source =
+      semantic_parent / "semantic-source.npsproj";
+  const auto lexical_wrong_source =
+      temporary.path() / "semantic-source.npsproj";
+  {
+    auto created =
+        ProjectStore::create(semantic_source, source_bytes);
+    CHECK(created.read_source_bytes() == source_bytes);
+    created.close();
+  }
+  REQUIRE(std::filesystem::equivalent(
+      semantic_source, expected_semantic_source));
+  CHECK_FALSE(std::filesystem::exists(lexical_wrong_source));
+
+  const auto semantic_target =
+      semantic_alias / ".." / "semantic-target.npsproj";
+  const auto expected_semantic_target =
+      semantic_parent / "semantic-target.npsproj";
+  auto semantic_migration =
+      ProjectStore::migrate_v1_to_v2(
+          semantic_source, semantic_target);
+  CHECK(semantic_migration.project_format() == "nps.project/v2");
+  CHECK(semantic_migration.read_source_bytes() == source_bytes);
+  REQUIRE(std::filesystem::equivalent(
+      semantic_target, expected_semantic_target));
+#endif
+}
+
+TEST_CASE("dangling final project links are never treated as absent") {
+  TemporaryProjectRoot temporary;
+  const auto create_link = temporary.project("create-link.npsproj");
+  const auto missing_create_target =
+      temporary.project("missing-create-target.npsproj");
+  std::error_code link_error;
+  std::filesystem::create_directory_symlink(
+      missing_create_target, create_link, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "Directory symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+#else
+  REQUIRE_FALSE(link_error);
+#endif
+
+  require_store_error("IO_PROJECT_EXISTS", [&] {
+    static_cast<void>(
+        ProjectStore::create(create_link, make_source_bytes()));
+  });
+  CHECK(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(create_link)));
+
+  const auto source_path = temporary.project("source.npsproj");
+  {
+    auto source =
+        ProjectStore::create(source_path, make_source_bytes(23, 17));
+    source.close();
+  }
+  const auto migration_link =
+      temporary.project("migration-link.npsproj");
+  const auto missing_migration_target =
+      temporary.project("missing-migration-target.npsproj");
+  link_error.clear();
+  std::filesystem::create_directory_symlink(
+      missing_migration_target, migration_link, link_error);
+  REQUIRE_FALSE(link_error);
+
+  require_store_error("IO_MIGRATION_TARGET_CONFLICT", [&] {
+    static_cast<void>(
+        ProjectStore::migrate_v1_to_v2(source_path, migration_link));
+  });
+  CHECK(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(migration_link)));
+}
+
+TEST_CASE("final project-root links remain rejected on open and migration") {
+  TemporaryProjectRoot temporary;
+  const auto real_source = temporary.project("real-source.npsproj");
+  {
+    auto source =
+        ProjectStore::create(real_source, make_source_bytes());
+    source.close();
+  }
+
+  const auto linked_source = temporary.project("linked-source.npsproj");
+  std::error_code link_error;
+  std::filesystem::create_directory_symlink(
+      real_source, linked_source, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "Directory symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+#else
+  REQUIRE_FALSE(link_error);
+#endif
+
+  require_store_error("IO_PROJECT_OPEN", [&] {
+    static_cast<void>(ProjectStore::open(linked_source));
+  });
+  require_store_error("IO_PROJECT_OPEN", [&] {
+    static_cast<void>(ProjectStore::migrate_v1_to_v2(
+        linked_source, temporary.project("must-not-exist.npsproj")));
+  });
+  CHECK_FALSE(
+      std::filesystem::exists(temporary.project("must-not-exist.npsproj")));
+}
+
+TEST_CASE("final project database links remain rejected") {
+  TemporaryProjectRoot temporary;
+  const auto source_path = temporary.project("linked-database.npsproj");
+  {
+    auto source =
+        ProjectStore::create(source_path, make_source_bytes());
+    source.close();
+  }
+
+  const auto database_path = source_path / "project.db";
+  const auto real_database_path = source_path / "project-real.db";
+  std::error_code rename_error;
+  std::filesystem::rename(
+      database_path, real_database_path, rename_error);
+  REQUIRE_FALSE(rename_error);
+
+  std::error_code link_error;
+  std::filesystem::create_symlink(
+      real_database_path, database_path, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "File symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+#else
+  REQUIRE_FALSE(link_error);
+#endif
+
+  require_store_error("IO_DATABASE_OPEN", [&] {
+    static_cast<void>(ProjectStore::open(source_path));
+  });
+  require_store_error("IO_DATABASE_OPEN", [&] {
+    static_cast<void>(ProjectStore::migrate_v1_to_v2(
+        source_path, temporary.project("must-not-exist.npsproj")));
+  });
+  CHECK_FALSE(
+      std::filesystem::exists(temporary.project("must-not-exist.npsproj")));
 }
 
 TEST_CASE("an open project holds an exclusive project lease") {

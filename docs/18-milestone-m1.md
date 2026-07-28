@@ -248,10 +248,10 @@ MSVC 19.50.35730.0、固定 vcpkg baseline
 `40f3c709db80acf154ac4b17a1f83c564ebd022e`，并启用
 `NPS_WARNINGS_AS_ERRORS=ON`：
 
-- Debug 从零配置和编译通过，最终跨工具链修复后完整 CTest 为 `108/108`，并额外
-  连续重复完整套件三次，均为 `108/108`；
-- Release 从零编译及最终增量安全构建通过，完整 CTest 为 `108/108`；
-- Catch2 单元层为 `107` 个用例、`2777` 条断言；
+- Debug 从零配置和编译通过，最终跨工具链及路径兼容修复后完整 CTest 为
+  `112/112`，并额外连续重复完整套件三次，均为 `112/112`；
+- Release 从零编译及最终增量安全构建通过，完整 CTest 为 `112/112`；
+- Catch2 单元层为 `111` 个用例、`2799` 条断言；
 - 串行进程测试实际覆盖提交恢复、`v1 → v2` 迁移故障、导出 hard-exit 和安全重试；
 - Release 安装树包含 CLI、OpenSSL/SQLite 运行时和许可声明；从安装树实际完成
   `demo → verify v1 → migrate-v1-v2 → verify v2 → export-demo`，输出通过 P6
@@ -261,11 +261,11 @@ MSVC 19.50.35730.0、固定 vcpkg baseline
 - 固定 Gitleaks 8.30.1 使用评审后的公共配置完成工作树和可达 Git 历史扫描，未发现
   泄漏。
 
-Windows 当前账户没有创建目录符号链接的权限，因此三个专门的目录 symlink 夹具以
-明确 warning 跳过；hard-link、ADS、Windows namespace、缺失保护范围和网络路径
-拒绝分支均在本机实际执行。同类 symlink 拒绝语义仍由实现、可创建的文件系统别名测试
-和远端 Linux/macOS 任务共同覆盖。CTest 外壳仍通过，但不能把未执行的 symlink 分支
-记为本机覆盖；远端首次运行仍需核对三个夹具确实执行。
+Windows 当前账户没有创建文件或目录符号链接的权限，因此对应 symlink 夹具以明确
+warning 跳过；hard-link、ADS、Windows namespace、缺失保护范围和网络路径拒绝分支
+均在本机实际执行。POSIX 父目录别名、`symlink/..` 真实解析语义，以及最终项目根和
+数据库的 symlink 拒绝必须由远端 Linux/macOS 任务实际覆盖。CTest 外壳通过不代表
+这些分支已在本机执行，远端首次运行仍需逐项核对。
 
 ### 5.7 CI 与公共仓库安全契约
 

@@ -247,8 +247,11 @@ recursive_triggers = OFF
 
 ## 8. 创建与发布
 
-创建要求目标 `.npsproj` 不存在，且其父目录是真实目录而非符号链接或 Windows
-reparse point。实现先在目标的同一父目录建立随机
+创建要求目标 `.npsproj` 不存在。Windows 要求其直接父目录不是 reparse point；
+POSIX 会先按文件系统语义解析已存在的父目录（包括 macOS 的 `/var → /private/var`
+这类系统别名），再拼回尚未解析的最终 `.npsproj` 文件名。这个顺序既保留
+`symlink/..` 的真实路径语义，又确保最终项目目录仍能通过 no-follow 状态检查拒绝
+符号链接。实现随后在解析所得目标的同一父目录建立随机
 `.nps-creating-<随机标识>/`：
 
 1. 写入 `.nps-creating` 标记和目录骨架；
@@ -346,9 +349,11 @@ M0 只接收 [严格命令契约](../commands/README.md) 中的三种命令。�
 自动修复。它不检查未使用的 `previews/`、`recovery/`、`manifests/` 内容，不验证像素
 审美正确性，也不证明文件没有恶意载荷。
 
-路径检查会拒绝已观察到的链接和 reparse point，并对 SQLite 与锁文件使用平台可用的
-no-follow 打开方式。但是部分对象路径仍采用“检查后再打开”的普通文件系统流程，
-存在同权限本地攻击者竞争改写的剩余风险；M0 项目读取不是安全沙箱边界。
+POSIX 接受已解析为真实目录的父路径别名，但不会解析最终 `.npsproj` 组件；Windows
+保持既有路径解析和 reparse 检查行为。最终项目根、`project.db` 和受保护对象路径会
+拒绝已观察到的链接/reparse point，并对 SQLite 与锁文件使用平台可用的 no-follow
+打开方式。但是部分路径仍采用“检查后再打开”的普通文件系统流程，存在同权限本地
+攻击者竞争改写的剩余风险；M0 项目读取不是安全沙箱边界。
 
 ## 13. 隐私与安全边界
 

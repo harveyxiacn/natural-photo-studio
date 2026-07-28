@@ -125,6 +125,8 @@ struct TileCacheStats final {
   std::size_t entry_count{};
   // Includes sample storage, the fixed-size key, and conservative
   // list/index bookkeeping rather than counting pixel payload alone.
+  // Entry counts can differ across standard-library ABIs; capacity_bytes
+  // bounds this accounted byte total, not a portable number of entries.
   std::size_t resident_bytes{};
   std::size_t capacity_bytes{};
 

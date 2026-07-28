@@ -14,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -146,6 +147,55 @@ void require_real_directory_ancestry(const std::filesystem::path& path) {
     current /= component;
     require_real_directory(current);
   }
+}
+
+[[nodiscard]] bool is_missing_path_error(
+    const std::error_code& error) noexcept {
+  return error == std::errc::no_such_file_or_directory ||
+         error == std::errc::not_a_directory;
+}
+
+[[nodiscard]] bool path_entry_exists_no_follow(
+    const std::filesystem::path& path,
+    std::string_view error_code,
+    std::string_view error_message) {
+  std::error_code error;
+  const auto status = std::filesystem::symlink_status(path, error);
+  if (error) {
+    if (is_missing_path_error(error)) {
+      return false;
+    }
+    throw_error(std::string(error_code), std::string(error_message));
+  }
+  return status.type() != std::filesystem::file_type::not_found;
+}
+
+[[nodiscard]] std::filesystem::path resolve_project_root(
+    const std::filesystem::path& project_root,
+    std::string_view error_message) {
+  std::error_code error;
+  std::filesystem::path resolved =
+      std::filesystem::absolute(project_root, error);
+  if (error || resolved.empty()) {
+    throw_error("IO_PROJECT_PATH", std::string(error_message));
+  }
+#ifdef _WIN32
+  resolved = resolved.lexically_normal();
+#else
+  // Resolve only the existing parent. The final .npsproj component must stay
+  // unresolved so the caller's lstat-style check can reject a project-root
+  // symlink while benign system aliases such as /var -> /private/var do not
+  // reach SQLite's SQLITE_OPEN_NOFOLLOW path-component rejection. Do not
+  // lexically collapse the POSIX path first: link/.. must be evaluated after
+  // link resolution, as it is by the filesystem.
+  const std::filesystem::path canonical_parent =
+      std::filesystem::canonical(resolved.parent_path(), error);
+  if (error || canonical_parent.empty()) {
+    throw_error("IO_PROJECT_PATH", std::string(error_message));
+  }
+  resolved = canonical_parent / resolved.filename();
+#endif
+  return resolved;
 }
 
 [[nodiscard]] std::string sha256(std::span<const std::uint8_t> bytes) {
@@ -1885,19 +1935,18 @@ ProjectStore ProjectStore::create(
     throw_error("IO_SOURCE_EMPTY", "The source image cannot be empty.");
   }
 
-  std::error_code error;
   const std::filesystem::path published_root =
-      std::filesystem::absolute(project_root, error).lexically_normal();
-  if (error) {
-    throw_error("IO_PROJECT_PATH", "The destination path could not be resolved.");
-  }
-  if (std::filesystem::exists(published_root, error)) {
+      resolve_project_root(
+          project_root,
+          "The destination path could not be resolved.");
+  if (path_entry_exists_no_follow(
+          published_root,
+          "IO_PROJECT_STAT",
+          "The destination project could not be inspected.")) {
     throw_error("IO_PROJECT_EXISTS", "The destination project already exists.");
   }
-  if (error) {
-    throw_error("IO_PROJECT_STAT", "The destination project could not be inspected.");
-  }
 
+  std::error_code error;
   const std::filesystem::path parent = published_root.parent_path();
   require_real_directory(parent);
   const std::filesystem::path staging_root =
@@ -2042,7 +2091,10 @@ ProjectStore ProjectStore::create(
   database.reset();
   std::filesystem::rename(staging_root, published_root, error);
   if (error) {
-    if (std::filesystem::exists(published_root)) {
+    if (path_entry_exists_no_follow(
+            published_root,
+            "IO_PROJECT_STAT",
+            "The destination project could not be inspected after publication.")) {
       throw_error(
           "IO_PROJECT_EXISTS",
           "Another process published the destination project first.");
@@ -2059,12 +2111,11 @@ ProjectStore ProjectStore::create(
 ProjectStore ProjectStore::open(
     const std::filesystem::path& project_root) {
   validate_project_root(project_root);
-  std::error_code error;
   const std::filesystem::path resolved_root =
-      std::filesystem::absolute(project_root, error).lexically_normal();
-  if (error) {
-    throw_error("IO_PROJECT_PATH", "The project path could not be resolved.");
-  }
+      resolve_project_root(
+          project_root,
+          "The project path could not be resolved.");
+  std::error_code error;
   const auto root_status = std::filesystem::symlink_status(resolved_root, error);
   if (error || !std::filesystem::is_directory(root_status) ||
       is_link_or_reparse_point(resolved_root, root_status)) {
@@ -2165,21 +2216,15 @@ ProjectStore ProjectStore::migrate_v1_to_v2(
   validate_project_root(source_root);
   validate_project_root(target_root);
 
-  std::error_code error;
   const std::filesystem::path resolved_source =
-      std::filesystem::absolute(source_root, error).lexically_normal();
-  if (error) {
-    throw_error(
-        "IO_PROJECT_PATH",
-        "The migration source path could not be resolved.");
-  }
+      resolve_project_root(
+          source_root,
+          "The migration source path could not be resolved.");
   const std::filesystem::path resolved_target =
-      std::filesystem::absolute(target_root, error).lexically_normal();
-  if (error) {
-    throw_error(
-        "IO_PROJECT_PATH",
-        "The migration target path could not be resolved.");
-  }
+      resolve_project_root(
+          target_root,
+          "The migration target path could not be resolved.");
+  std::error_code error;
   require_real_directory_ancestry(resolved_source.parent_path());
   require_real_directory_ancestry(resolved_target.parent_path());
   if (!std::filesystem::equivalent(
@@ -2244,13 +2289,10 @@ ProjectStore ProjectStore::migrate_v1_to_v2(
   const std::string source_fingerprint =
       migration_source_fingerprint(*source.impl_->database);
 
-  const bool target_exists =
-      std::filesystem::exists(resolved_target, error);
-  if (error) {
-    throw_error(
-        "IO_PROJECT_STAT",
-        "The migration target could not be inspected.");
-  }
+  const bool target_exists = path_entry_exists_no_follow(
+      resolved_target,
+      "IO_PROJECT_STAT",
+      "The migration target could not be inspected.");
   if (target_exists) {
     try {
       ProjectStore existing = ProjectStore::open(resolved_target);
@@ -2383,19 +2425,20 @@ ProjectStore ProjectStore::migrate_v1_to_v2(
   inject_crash_if_requested(
       fault_point, FaultPoint::after_migration_staged);
 
-  if (std::filesystem::exists(resolved_target, error)) {
+  if (path_entry_exists_no_follow(
+          resolved_target,
+          "IO_PROJECT_STAT",
+          "The migration target could not be inspected before publication.")) {
     throw_error(
         "IO_MIGRATION_TARGET_CONFLICT",
         "Another process published the migration target first.");
   }
-  if (error) {
-    throw_error(
-        "IO_PROJECT_STAT",
-        "The migration target could not be inspected before publication.");
-  }
   std::filesystem::rename(staging_root, resolved_target, error);
   if (error) {
-    if (std::filesystem::exists(resolved_target)) {
+    if (path_entry_exists_no_follow(
+            resolved_target,
+            "IO_PROJECT_STAT",
+            "The migration target could not be inspected after publication.")) {
       throw_error(
           "IO_MIGRATION_TARGET_CONFLICT",
           "Another process published the migration target first.");
