@@ -1,6 +1,6 @@
 # M1：不可变编辑 DAG 与 CPU 参考渲染器
 
-状态：In progress（本地实现与 Windows 门禁通过；远端三平台 CI/CodeQL 待验证）
+状态：Implemented（本地完整门禁与目标提交的三平台 CI、Sanitizer、CodeQL 均通过）
 
 计划版本基线：`0.2.0`
 
@@ -284,9 +284,36 @@ M1 工作流配置必须保持以下边界：
   持久化 checkout 凭据、宽泛权限与未按 digest 固定的容器；
 - 迁移/导出 hard-exit 场景属于串行进程级 CTest，具有独立标签和有界超时。
 
-远端仓库仍需由维护者配置分支保护，把 policy、三平台 core、sanitizer 与 CodeQL
-设为合并前必需检查。仓库内工作流不能证明远端保护规则已经启用；首次推送并取得实际
-检查结果前，本节只是一份安全契约，不是通过记录。
+远端仓库仍需配置分支保护，把 policy、三平台 core、sanitizer 与 CodeQL 设为后续
+合并前必需检查。仓库内工作流不能证明远端保护规则已经启用；该项属于仓库治理状态，
+必须通过 GitHub 设置的独立只读复核确认，不能由源码提交自行宣称。
+
+### 5.8 2026-07-27 远端验证证据
+
+PR #1 的目标 head 为
+[`203039fd9f7f71130f7b357d9fc976f34a92286c`](https://github.com/harveyxiacn/natural-photo-studio/commit/203039fd9f7f71130f7b357d9fc976f34a92286c)；
+GitHub 在合并候选 `887b4f85b110af4da77600b7643705e61df39b38` 上完成以下实际任务：
+
+- [CI run 30320734172](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734172)
+  总体成功；
+- [Public-source policy](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734172/job/90155872494)
+  成功，包含公共源码策略与固定 Gitleaks 历史扫描；
+- [Ubuntu 24.04 dev](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734172/job/90155909913)
+  成功，`110/110`；
+- [macOS 15 arm64 dev](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734172/job/90155909895)
+  成功，`110/110`；日志确认 POSIX 父目录别名、`symlink/..`、悬空最终链接、最终
+  项目根/数据库链接拒绝及运行时校准缓存测试均实际执行并通过；
+- [Windows Server 2022 release](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734172/job/90155909920)
+  成功，`112/112`；
+- [ASan/UBSan](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734172/job/90155909873)
+  成功，`110/110`；
+- [CodeQL run 30320734148](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734148)
+  及其 [Analyze C/C++](https://github.com/harveyxiacn/natural-photo-studio/actions/runs/30320734148/job/90155872224)
+  成功，分析结果完成上传。
+
+Unix 与 Windows 的 CTest 数量差异来自平台条件测试，不是缺测：Unix 实际执行 POSIX
+链接语义，Windows 实际执行其专属路径/替换测试。上述链接是首次全绿目标提交的证据；
+后续仅更新验收文档的提交仍须再次通过同一组门禁。
 
 ## 6. M1 完成定义
 
@@ -300,9 +327,10 @@ M1 工作流配置必须保持以下边界：
 6. M1 非目标在 README、CLI 帮助和发布说明中没有被夸大；
 7. 里程碑提交经隐私/安全复核后提交并推送。
 
-截至 2026-07-26，本地实现、Windows Debug/Release、进程恢复、安装冒烟和公共仓库
-策略已经形成上述证据。公共 GitHub 尚未取得该提交的 Windows/Linux/macOS、
-sanitizer 和 CodeQL 实际结果，也尚未验证分支保护，因此 M1 保持 `In progress`。
+截至 2026-07-27，本地实现、Windows Debug/Release、进程恢复、安装冒烟、公共仓库
+策略，以及目标提交的 Windows/Linux/macOS、Sanitizer 和 CodeQL 均形成上述证据，
+因此 M1 达到 `Implemented`。分支保护、仓库安全设置和 PR 合并仍按仓库治理流程单独
+执行与验证，不扩大 M1 的产品功能范围。
 
 ## 7. 后续入口
 
