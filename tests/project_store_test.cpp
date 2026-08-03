@@ -1,8 +1,10 @@
 #include "nps/core/project_store.hpp"
+#include "nps/document/edit_graph.hpp"
 #include "nps/imaging/ppm16.hpp"
 #include "nps/imaging/synthetic.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <sqlite3.h>
 
 #include <atomic>
 #include <chrono>
@@ -15,6 +17,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -52,8 +55,31 @@ class TemporaryProjectRoot final {
     return path_ / filename;
   }
 
+  [[nodiscard]] const std::filesystem::path& path() const noexcept {
+    return path_;
+  }
+
  private:
   std::filesystem::path path_;
+};
+
+class ScopedCurrentPath final {
+ public:
+  explicit ScopedCurrentPath(const std::filesystem::path& path)
+      : original_(std::filesystem::current_path()) {
+    std::filesystem::current_path(path);
+  }
+
+  ~ScopedCurrentPath() {
+    std::error_code ignored;
+    std::filesystem::current_path(original_, ignored);
+  }
+
+  ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+  ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+
+ private:
+  std::filesystem::path original_;
 };
 
 [[nodiscard]] std::vector<std::uint8_t> as_unsigned_bytes(
@@ -73,6 +99,93 @@ class TemporaryProjectRoot final {
       nps::imaging::make_deterministic_gradient(width, height)));
 }
 
+void execute_database_sql(
+    const std::filesystem::path& database_path,
+    const std::string_view sql) {
+  const auto path_bytes = database_path.generic_u8string();
+  const std::string path{
+      reinterpret_cast<const char*>(path_bytes.data()),
+      path_bytes.size()};
+  sqlite3* database = nullptr;
+  if (sqlite3_open_v2(
+          path.c_str(),
+          &database,
+          SQLITE_OPEN_READWRITE | SQLITE_OPEN_EXRESCODE,
+          nullptr) != SQLITE_OK) {
+    if (database != nullptr) {
+      sqlite3_close_v2(database);
+    }
+    throw std::runtime_error{"unable to open test project database"};
+  }
+  char* message = nullptr;
+  const std::string statement{sql};
+  const int result =
+      sqlite3_exec(database, statement.c_str(), nullptr, nullptr, &message);
+  if (message != nullptr) {
+    sqlite3_free(message);
+  }
+  const int close_result = sqlite3_close_v2(database);
+  if (result != SQLITE_OK || close_result != SQLITE_OK) {
+    throw std::runtime_error{"unable to update test project database"};
+  }
+}
+
+[[nodiscard]] std::string query_database_text(
+    const std::filesystem::path& database_path,
+    const std::string_view sql) {
+  const auto path_bytes = database_path.generic_u8string();
+  const std::string path{
+      reinterpret_cast<const char*>(path_bytes.data()),
+      path_bytes.size()};
+  sqlite3* database = nullptr;
+  if (sqlite3_open_v2(
+          path.c_str(),
+          &database,
+          SQLITE_OPEN_READONLY | SQLITE_OPEN_EXRESCODE,
+          nullptr) != SQLITE_OK) {
+    if (database != nullptr) {
+      sqlite3_close_v2(database);
+    }
+    throw std::runtime_error{"unable to open test project database"};
+  }
+
+  sqlite3_stmt* statement = nullptr;
+  const std::string query{sql};
+  const int prepare_result = sqlite3_prepare_v2(
+      database, query.c_str(), -1, &statement, nullptr);
+  if (prepare_result != SQLITE_OK || statement == nullptr) {
+    if (statement != nullptr) {
+      sqlite3_finalize(statement);
+    }
+    sqlite3_close_v2(database);
+    throw std::runtime_error{"unable to prepare test project query"};
+  }
+
+  std::string value;
+  bool valid = sqlite3_step(statement) == SQLITE_ROW &&
+               sqlite3_column_count(statement) == 1 &&
+               sqlite3_column_type(statement, 0) == SQLITE_TEXT;
+  if (valid) {
+    const auto* text = sqlite3_column_text(statement, 0);
+    const int bytes = sqlite3_column_bytes(statement, 0);
+    valid = text != nullptr && bytes >= 0;
+    if (valid) {
+      value.assign(
+          reinterpret_cast<const char*>(text),
+          static_cast<std::size_t>(bytes));
+      valid = sqlite3_step(statement) == SQLITE_DONE;
+    }
+  }
+
+  const int finalize_result = sqlite3_finalize(statement);
+  const int close_result = sqlite3_close_v2(database);
+  if (!valid || finalize_result != SQLITE_OK ||
+      close_result != SQLITE_OK) {
+    throw std::runtime_error{"unable to query test project database"};
+  }
+  return value;
+}
+
 [[nodiscard]] StoreCommand command(
     StoreMutation mutation,
     std::int64_t expected_revision,
@@ -84,7 +197,10 @@ class TemporaryProjectRoot final {
       .request_fingerprint = "fingerprint-" + token,
       .expected_revision = expected_revision,
       .mutation = mutation,
-      .exposure_delta_ev = exposure_delta_ev};
+      .exposure_delta_ev = exposure_delta_ev,
+      .edit_graph_json = {},
+      .edit_graph_sha256 = {},
+      .working_color_id = {}};
 }
 
 template <typename Action>
@@ -325,6 +441,288 @@ TEST_CASE("clean close and reopen retain the committed project") {
   CHECK_FALSE(integrity.recovered_unclean_shutdown);
 }
 
+TEST_CASE("relative project operations remain usable after cwd changes") {
+  TemporaryProjectRoot temporary;
+  const auto source = make_source_bytes();
+  const auto unrelated = temporary.path() / "unrelated";
+  REQUIRE(std::filesystem::create_directory(unrelated));
+
+  SECTION("create captures an absolute project identity") {
+    ScopedCurrentPath current_path(temporary.path());
+    auto created =
+        ProjectStore::create("created-relative.npsproj", source);
+    std::filesystem::current_path(unrelated);
+
+    CHECK(created.read_source_bytes() == source);
+    CHECK(created.verify_integrity().referenced_objects == 1);
+  }
+
+  SECTION("open captures an absolute project identity") {
+    const auto project_path = temporary.project("opened-relative.npsproj");
+    {
+      auto created = ProjectStore::create(project_path, source);
+      created.close();
+    }
+    ScopedCurrentPath current_path(temporary.path());
+    auto reopened = ProjectStore::open("opened-relative.npsproj");
+    std::filesystem::current_path(unrelated);
+
+    CHECK(reopened.read_source_bytes() == source);
+    CHECK(reopened.verify_integrity().referenced_objects == 1);
+  }
+
+  SECTION("migration captures absolute source and target identities") {
+    const auto source_path = temporary.project("legacy-relative.npsproj");
+    {
+      auto source_project = ProjectStore::create(source_path, source);
+      source_project.close();
+    }
+    ScopedCurrentPath current_path(temporary.path());
+    auto migrated = ProjectStore::migrate_v1_to_v2(
+        "legacy-relative.npsproj",
+        "migrated-relative.npsproj");
+    std::filesystem::current_path(unrelated);
+
+    CHECK(migrated.project_format() == "nps.project/v2");
+    CHECK(migrated.read_source_bytes() == source);
+    CHECK(migrated.verify_integrity().referenced_objects == 1);
+  }
+}
+
+TEST_CASE(
+    "POSIX parent aliases are canonicalized before project operations") {
+  TemporaryProjectRoot temporary;
+  const auto real_parent = temporary.path() / "real-parent";
+  const auto alias_parent = temporary.path() / "parent-alias";
+  REQUIRE(std::filesystem::create_directory(real_parent));
+
+  std::error_code link_error;
+  std::filesystem::create_directory_symlink(
+      real_parent, alias_parent, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "Directory symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+
+  require_store_error("IO_OBJECT_LINK", [&] {
+    static_cast<void>(ProjectStore::create(
+        alias_parent / "legacy.npsproj", make_source_bytes()));
+  });
+#else
+  REQUIRE_FALSE(link_error);
+  const auto source_bytes = make_source_bytes(29, 13);
+  const auto alias_source = alias_parent / "legacy.npsproj";
+  const auto real_source = real_parent / "legacy.npsproj";
+  const auto alias_target = alias_parent / "migrated.npsproj";
+  const auto real_target = real_parent / "migrated.npsproj";
+  const auto retarget_parent = temporary.path() / "retarget-parent";
+  REQUIRE(std::filesystem::create_directory(retarget_parent));
+
+  {
+    auto created = ProjectStore::create(alias_source, source_bytes);
+    CHECK(created.read_source_bytes() == source_bytes);
+    created.close();
+  }
+  REQUIRE(std::filesystem::equivalent(alias_source, real_source));
+
+  {
+    auto reopened = ProjectStore::open(alias_source);
+    CHECK(reopened.project_format() == "nps.project/v1");
+    CHECK(reopened.read_source_bytes() == source_bytes);
+
+    link_error.clear();
+    REQUIRE(std::filesystem::remove(alias_parent, link_error));
+    REQUIRE_FALSE(link_error);
+    std::filesystem::create_directory_symlink(
+        retarget_parent, alias_parent, link_error);
+    REQUIRE_FALSE(link_error);
+    CHECK(reopened.read_source_bytes() == source_bytes);
+    CHECK(reopened.verify_integrity().referenced_objects == 1);
+    reopened.close();
+
+    link_error.clear();
+    REQUIRE(std::filesystem::remove(alias_parent, link_error));
+    REQUIRE_FALSE(link_error);
+    std::filesystem::create_directory_symlink(
+        real_parent, alias_parent, link_error);
+    REQUIRE_FALSE(link_error);
+  }
+
+  auto migrated =
+      ProjectStore::migrate_v1_to_v2(alias_source, alias_target);
+  CHECK(migrated.project_format() == "nps.project/v2");
+  CHECK(migrated.read_source_bytes() == source_bytes);
+  CHECK(migrated.verify_integrity().referenced_objects == 1);
+  REQUIRE(std::filesystem::equivalent(alias_target, real_target));
+  migrated.close();
+
+  const auto semantic_parent = real_parent / "semantic-parent";
+  const auto semantic_nested = semantic_parent / "nested";
+  const auto semantic_alias = temporary.path() / "semantic-alias";
+  REQUIRE(std::filesystem::create_directories(semantic_nested));
+  link_error.clear();
+  std::filesystem::create_directory_symlink(
+      semantic_nested, semantic_alias, link_error);
+  REQUIRE_FALSE(link_error);
+
+  const auto semantic_source =
+      semantic_alias / ".." / "semantic-source.npsproj";
+  const auto expected_semantic_source =
+      semantic_parent / "semantic-source.npsproj";
+  const auto lexical_wrong_source =
+      temporary.path() / "semantic-source.npsproj";
+  {
+    auto created =
+        ProjectStore::create(semantic_source, source_bytes);
+    CHECK(created.read_source_bytes() == source_bytes);
+    created.close();
+  }
+  REQUIRE(std::filesystem::equivalent(
+      semantic_source, expected_semantic_source));
+  CHECK_FALSE(std::filesystem::exists(lexical_wrong_source));
+
+  const auto semantic_target =
+      semantic_alias / ".." / "semantic-target.npsproj";
+  const auto expected_semantic_target =
+      semantic_parent / "semantic-target.npsproj";
+  auto semantic_migration =
+      ProjectStore::migrate_v1_to_v2(
+          semantic_source, semantic_target);
+  CHECK(semantic_migration.project_format() == "nps.project/v2");
+  CHECK(semantic_migration.read_source_bytes() == source_bytes);
+  REQUIRE(std::filesystem::equivalent(
+      semantic_target, expected_semantic_target));
+#endif
+}
+
+TEST_CASE("dangling final project links are never treated as absent") {
+  TemporaryProjectRoot temporary;
+  const auto create_link = temporary.project("create-link.npsproj");
+  const auto missing_create_target =
+      temporary.project("missing-create-target.npsproj");
+  std::error_code link_error;
+  std::filesystem::create_directory_symlink(
+      missing_create_target, create_link, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "Directory symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+#else
+  REQUIRE_FALSE(link_error);
+#endif
+
+  require_store_error("IO_PROJECT_EXISTS", [&] {
+    static_cast<void>(
+        ProjectStore::create(create_link, make_source_bytes()));
+  });
+  CHECK(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(create_link)));
+
+  const auto source_path = temporary.project("source.npsproj");
+  {
+    auto source =
+        ProjectStore::create(source_path, make_source_bytes(23, 17));
+    source.close();
+  }
+  const auto migration_link =
+      temporary.project("migration-link.npsproj");
+  const auto missing_migration_target =
+      temporary.project("missing-migration-target.npsproj");
+  link_error.clear();
+  std::filesystem::create_directory_symlink(
+      missing_migration_target, migration_link, link_error);
+  REQUIRE_FALSE(link_error);
+
+  require_store_error("IO_MIGRATION_TARGET_CONFLICT", [&] {
+    static_cast<void>(
+        ProjectStore::migrate_v1_to_v2(source_path, migration_link));
+  });
+  CHECK(std::filesystem::is_symlink(
+      std::filesystem::symlink_status(migration_link)));
+}
+
+TEST_CASE("final project-root links remain rejected on open and migration") {
+  TemporaryProjectRoot temporary;
+  const auto real_source = temporary.project("real-source.npsproj");
+  {
+    auto source =
+        ProjectStore::create(real_source, make_source_bytes());
+    source.close();
+  }
+
+  const auto linked_source = temporary.project("linked-source.npsproj");
+  std::error_code link_error;
+  std::filesystem::create_directory_symlink(
+      real_source, linked_source, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "Directory symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+#else
+  REQUIRE_FALSE(link_error);
+#endif
+
+  require_store_error("IO_PROJECT_OPEN", [&] {
+    static_cast<void>(ProjectStore::open(linked_source));
+  });
+  require_store_error("IO_PROJECT_OPEN", [&] {
+    static_cast<void>(ProjectStore::migrate_v1_to_v2(
+        linked_source, temporary.project("must-not-exist.npsproj")));
+  });
+  CHECK_FALSE(
+      std::filesystem::exists(temporary.project("must-not-exist.npsproj")));
+}
+
+TEST_CASE("final project database links remain rejected") {
+  TemporaryProjectRoot temporary;
+  const auto source_path = temporary.project("linked-database.npsproj");
+  {
+    auto source =
+        ProjectStore::create(source_path, make_source_bytes());
+    source.close();
+  }
+
+  const auto database_path = source_path / "project.db";
+  const auto real_database_path = source_path / "project-real.db";
+  std::error_code rename_error;
+  std::filesystem::rename(
+      database_path, real_database_path, rename_error);
+  REQUIRE_FALSE(rename_error);
+
+  std::error_code link_error;
+  std::filesystem::create_symlink(
+      real_database_path, database_path, link_error);
+#ifdef _WIN32
+  if (link_error) {
+    WARN(
+        "File symlinks are unavailable in this test environment: "
+        << link_error.message());
+    return;
+  }
+#else
+  REQUIRE_FALSE(link_error);
+#endif
+
+  require_store_error("IO_DATABASE_OPEN", [&] {
+    static_cast<void>(ProjectStore::open(source_path));
+  });
+  require_store_error("IO_DATABASE_OPEN", [&] {
+    static_cast<void>(ProjectStore::migrate_v1_to_v2(
+        source_path, temporary.project("must-not-exist.npsproj")));
+  });
+  CHECK_FALSE(
+      std::filesystem::exists(temporary.project("must-not-exist.npsproj")));
+}
+
 TEST_CASE("an open project holds an exclusive project lease") {
   TemporaryProjectRoot temporary;
   const auto project_path = temporary.project();
@@ -407,4 +805,294 @@ TEST_CASE("integrity rejects a linked object-store root") {
   require_store_error("IO_OBJECT_LINK", [&] {
     static_cast<void>(project.verify_integrity());
   });
+}
+
+TEST_CASE("explicit v1 to v2 migration preserves history and idempotency") {
+  TemporaryProjectRoot temporary;
+  const auto source_path = temporary.project("legacy.npsproj");
+  const auto target_path = temporary.project("migrated.npsproj");
+  const auto source_bytes = make_source_bytes(31, 17);
+
+  std::string document_id;
+  std::int64_t first_snapshot_id = 0;
+  std::int64_t second_snapshot_id = 0;
+  {
+    auto legacy = ProjectStore::create(source_path, source_bytes);
+    document_id = legacy.document_id();
+    CHECK(legacy.project_format() == "nps.project/v1");
+    const auto first = legacy.execute(
+        command(StoreMutation::adjust_exposure, 0, "migrate-first", 1.0));
+    const auto second = legacy.execute(
+        command(StoreMutation::adjust_exposure, 1, "migrate-second", 0.5));
+    first_snapshot_id = first.snapshot.id;
+    second_snapshot_id = second.snapshot.id;
+    const auto undo = legacy.execute(
+        command(StoreMutation::undo, 2, "migrate-undo"));
+    REQUIRE(undo.snapshot.id == first_snapshot_id);
+    legacy.close();
+  }
+
+  auto migrated =
+      ProjectStore::migrate_v1_to_v2(source_path, target_path);
+  CHECK(migrated.project_format() == "nps.project/v2");
+  CHECK(migrated.document_id() == document_id);
+  CHECK(migrated.current_revision() == 3);
+  const auto migrated_current = migrated.current_snapshot();
+  CHECK(migrated_current.id == first_snapshot_id);
+  CHECK(migrated_current.exposure_ev == 1.0);
+  CHECK(
+      migrated_current.working_color_id ==
+      "nps.color/scene-linear-rec2020-d65/v1");
+  REQUIRE(is_lower_sha256(migrated_current.edit_graph_sha256));
+  const auto parsed = nps::document::parse_edit_graph_json(
+      migrated_current.edit_graph_json);
+  if (const auto* error =
+          std::get_if<nps::document::EditGraphError>(&parsed)) {
+    UNSCOPED_INFO(
+        "migrated graph parse error: "
+        << nps::document::to_string(error->code) << ": " << error->message);
+  }
+  REQUIRE(std::holds_alternative<nps::document::EditGraph>(parsed));
+  const auto& graph = std::get<nps::document::EditGraph>(parsed);
+  CHECK(
+      nps::document::canonical_edit_graph_json(graph) ==
+      migrated_current.edit_graph_json);
+  CHECK(
+      nps::document::edit_graph_sha256(graph) ==
+      migrated_current.edit_graph_sha256);
+  CHECK(migrated.read_source_bytes() == source_bytes);
+
+  const auto redo = migrated.execute(
+      command(StoreMutation::redo, 3, "migrated-redo"));
+  CHECK(redo.snapshot.id == second_snapshot_id);
+  CHECK(redo.snapshot.exposure_ev == 1.5);
+  CHECK_FALSE(redo.snapshot.edit_graph_json.empty());
+
+  auto first_retry =
+      command(StoreMutation::adjust_exposure, 0, "migrate-first", 1.0);
+  first_retry.command_id = "cmd-migrate-first-transport-retry";
+  const auto replayed = migrated.execute(first_retry);
+  CHECK(replayed.idempotent_replay);
+  CHECK(replayed.new_revision == 1);
+  CHECK(replayed.snapshot.id == first_snapshot_id);
+  CHECK(migrated.current_revision() == 4);
+
+  const auto replacement_source = migrated.current_snapshot();
+  StoreCommand replacement{
+      .command_id = "cmd-replace-graph",
+      .idempotency_key = "idempotency-replace-graph",
+      .request_fingerprint = "fingerprint-replace-graph",
+      .expected_revision = 4,
+      .mutation = StoreMutation::replace_graph,
+      .exposure_delta_ev = 0.0,
+      .edit_graph_json = replacement_source.edit_graph_json,
+      .edit_graph_sha256 = replacement_source.edit_graph_sha256,
+      .working_color_id = replacement_source.working_color_id};
+  const auto replaced = migrated.execute(replacement);
+  CHECK(replaced.new_revision == 5);
+  CHECK(replaced.snapshot.id != replacement_source.id);
+  CHECK(
+      replaced.snapshot.edit_graph_sha256 ==
+      replacement_source.edit_graph_sha256);
+  CHECK(migrated.verify_integrity().revision == 5);
+  migrated.close();
+
+  auto legacy = ProjectStore::open(source_path);
+  CHECK(legacy.project_format() == "nps.project/v1");
+  CHECK(legacy.document_id() == document_id);
+  CHECK(legacy.current_revision() == 3);
+  CHECK(legacy.current_snapshot().id == first_snapshot_id);
+  CHECK(legacy.current_snapshot().edit_graph_json.empty());
+  CHECK(legacy.read_source_bytes() == source_bytes);
+  legacy.close();
+
+  auto idempotent =
+      ProjectStore::migrate_v1_to_v2(source_path, target_path);
+  CHECK(idempotent.project_format() == "nps.project/v2");
+  CHECK(idempotent.current_revision() == 5);
+}
+
+TEST_CASE("v1 graph replacement requires explicit migration") {
+  TemporaryProjectRoot temporary;
+  auto legacy =
+      ProjectStore::create(temporary.project(), make_source_bytes());
+  const StoreCommand replacement{
+      .command_id = "cmd-v1-replace",
+      .idempotency_key = "idempotency-v1-replace",
+      .request_fingerprint = "fingerprint-v1-replace",
+      .expected_revision = 0,
+      .mutation = StoreMutation::replace_graph,
+      .exposure_delta_ev = 0.0,
+      .edit_graph_json = "{}",
+      .edit_graph_sha256 = std::string(64U, '0'),
+      .working_color_id =
+          "nps.color/scene-linear-rec2020-d65/v1"};
+  require_store_error("IO_PROJECT_MIGRATION_REQUIRED", [&] {
+    static_cast<void>(legacy.execute(replacement));
+  });
+  CHECK(legacy.current_revision() == 0);
+}
+
+TEST_CASE("migration never overwrites a conflicting target") {
+  TemporaryProjectRoot temporary;
+  const auto source_path = temporary.project("source.npsproj");
+  const auto target_path = temporary.project("target.npsproj");
+  {
+    auto source = ProjectStore::create(source_path, make_source_bytes());
+    source.close();
+    auto target =
+        ProjectStore::create(target_path, make_source_bytes(7, 9));
+    target.close();
+  }
+
+  require_store_error("IO_MIGRATION_TARGET_CONFLICT", [&] {
+    static_cast<void>(
+        ProjectStore::migrate_v1_to_v2(source_path, target_path));
+  });
+  auto target = ProjectStore::open(target_path);
+  CHECK(target.project_format() == "nps.project/v1");
+  CHECK(target.current_revision() == 0);
+}
+
+TEST_CASE(
+    "project open and migration reject unsupported SQLite schema objects") {
+  SECTION("open validates the schema before changing clean-shutdown state") {
+    TemporaryProjectRoot temporary;
+    const auto project_path = temporary.project("trigger-open.npsproj");
+    const StoreCommand original =
+        command(StoreMutation::adjust_exposure, 0, "schema-open", 1.0);
+    {
+      auto project =
+          ProjectStore::create(project_path, make_source_bytes());
+      static_cast<void>(project.execute(original));
+      project.close();
+    }
+    execute_database_sql(
+        project_path / "project.db",
+        "CREATE TRIGGER nps_open_attack "
+        "AFTER UPDATE OF value ON meta "
+        "WHEN NEW.key='clean_shutdown' "
+        "BEGIN "
+        "UPDATE transactions "
+        "SET request_fingerprint='tampered'; "
+        "END;");
+
+    require_store_error("IO_PROJECT_SCHEMA", [&] {
+      static_cast<void>(ProjectStore::open(project_path));
+    });
+
+    CHECK(
+        query_database_text(
+            project_path / "project.db",
+            "SELECT request_fingerprint FROM transactions "
+            "WHERE revision=1;") == original.request_fingerprint);
+    CHECK(
+        query_database_text(
+            project_path / "project.db",
+            "SELECT value FROM meta "
+            "WHERE key='clean_shutdown';") == "1");
+
+    execute_database_sql(
+        project_path / "project.db",
+        "DROP TRIGGER nps_open_attack;");
+    auto reopened = ProjectStore::open(project_path);
+    CHECK(reopened.current_revision() == 1);
+    StoreCommand retry = original;
+    retry.command_id = "cmd-schema-open-retry";
+    const auto replayed = reopened.execute(retry);
+    CHECK(replayed.idempotent_replay);
+    CHECK(replayed.new_revision == 1);
+    CHECK(reopened.verify_integrity().revision == 1);
+  }
+
+  SECTION("migration never executes a copied schema trigger") {
+    TemporaryProjectRoot temporary;
+    const auto source_path = temporary.project("trigger-source.npsproj");
+    const auto target_path = temporary.project("trigger-target.npsproj");
+    const StoreCommand original =
+        command(StoreMutation::adjust_exposure, 0, "schema-migrate", 1.0);
+    std::string source_hash;
+    {
+      auto source =
+          ProjectStore::create(source_path, make_source_bytes());
+      const auto committed = source.execute(original);
+      source_hash = committed.snapshot.source_hash;
+      source.close();
+    }
+    execute_database_sql(
+        source_path / "project.db",
+        "CREATE TRIGGER nps_migration_attack "
+        "AFTER UPDATE OF value ON meta "
+        "WHEN NEW.key='format' "
+        "BEGIN "
+        "UPDATE snapshots_v2 "
+        "SET exposure_ev=exposure_ev+7.0; "
+        "UPDATE transactions "
+        "SET request_fingerprint='tampered'; "
+        "UPDATE idempotency "
+        "SET request_fingerprint='tampered'; "
+        "END;");
+
+    require_store_error("IO_PROJECT_SCHEMA", [&] {
+      static_cast<void>(
+          ProjectStore::migrate_v1_to_v2(source_path, target_path));
+    });
+    CHECK_FALSE(std::filesystem::exists(target_path));
+
+    CHECK(
+        query_database_text(
+            source_path / "project.db",
+            "SELECT printf('%.1f', exposure_ev) FROM snapshots "
+            "WHERE id=CAST((SELECT value FROM meta "
+            "WHERE key='current_snapshot_id') AS INTEGER);") == "1.0");
+    CHECK(
+        query_database_text(
+            source_path / "project.db",
+            "SELECT request_fingerprint FROM transactions "
+            "WHERE revision=1;") == original.request_fingerprint);
+    CHECK(
+        query_database_text(
+            source_path / "project.db",
+            "SELECT value FROM meta "
+            "WHERE key='clean_shutdown';") == "1");
+
+    execute_database_sql(
+        source_path / "project.db",
+        "DROP TRIGGER nps_migration_attack;");
+    auto source = ProjectStore::open(source_path);
+    CHECK(source.current_revision() == 1);
+    CHECK(source.current_snapshot().source_hash == source_hash);
+    CHECK(source.current_snapshot().exposure_ev == 1.0);
+    StoreCommand retry = original;
+    retry.command_id = "cmd-schema-migrate-retry";
+    CHECK(source.execute(retry).idempotent_replay);
+    CHECK(source.verify_integrity().revision == 1);
+  }
+}
+
+TEST_CASE("failed migration leaves the target unpublished") {
+  TemporaryProjectRoot temporary;
+  const auto source_path = temporary.project("corrupt-source.npsproj");
+  const auto target_path = temporary.project("must-not-exist.npsproj");
+  std::filesystem::path source_object;
+  {
+    auto source =
+        ProjectStore::create(source_path, make_source_bytes());
+    source_object =
+        object_path(source_path, source.current_snapshot().source_hash);
+    source.close();
+  }
+  {
+    std::ofstream corrupt(
+        source_object, std::ios::binary | std::ios::trunc);
+    REQUIRE(corrupt);
+    corrupt.put('\0');
+    REQUIRE(corrupt);
+  }
+
+  require_store_error("IO_OBJECT_CORRUPT", [&] {
+    static_cast<void>(
+        ProjectStore::migrate_v1_to_v2(source_path, target_path));
+  });
+  CHECK_FALSE(std::filesystem::exists(target_path));
 }

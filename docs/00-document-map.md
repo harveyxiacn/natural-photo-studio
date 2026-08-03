@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-本目录是 Natural Photo Studio 的产品设计与工程基线文档源。它用于统一产品范围、交互、图像质量、架构、隐私、测试和交付标准，防止“先做一个 AI 按钮，再逐步补专业能力”的方向漂移。当前已经有 M0 可恢复非破坏编辑内核；完整产品设计仍需按本文的治理规则评审。
+本目录是 Natural Photo Studio 的产品设计与工程基线文档源。它用于统一产品范围、交互、图像质量、架构、隐私、测试和交付标准，防止“先做一个 AI 按钮，再逐步补专业能力”的方向漂移。当前已有 M0 可恢复非破坏编辑内核，M1 不可变编辑图与 CPU 参考渲染器已通过 Windows 本地门禁、等待公共仓库远端验证；完整产品设计仍需按本文的治理规则评审。
 
 ## 2. 文档状态
 
@@ -11,10 +11,18 @@
 | Draft | 方向可讨论，不能作为跨模块接口依据 |
 | Proposed | 已给出完整方案，等待产品/技术评审 |
 | Accepted | 已评审，可用于实现和验收 |
+| Accepted for M1 | 只在 M1 明确范围内已评审；不能外推为完整产品决定 |
 | Implemented | 已有对应代码和自动化证据；仍须说明适用版本及已知限制 |
 | Superseded | 已被新文档或 ADR 取代 |
 
-01–16 号完整产品设计与四份 ADR 当前仍为 `Proposed`。M0 工程基线已经实现，其实际持久化契约以 [`nps.project/v1`](../specs/project-format/nps.project.v1.md) 和 [M0 实现说明](17-milestone-m0.md) 为准。进入对应的完整产品模块开发前，仍需把受影响的产品设计和 ADR 评审为 `Accepted`；M0 的存在不表示未来格式、UI、AI 或安全方案已经冻结。
+01–16 号完整产品设计与 ADR-0001–0004 当前仍为 `Proposed`。M0 工程基线已经实现，
+其实际持久化契约以
+[`nps.project/v1`](../specs/project-format/nps.project.v1.md) 和
+[M0 实现说明](17-milestone-m0.md) 为准。
+[ADR-0005](adr/ADR-0005-explicit-color-pixel-contract.md) 已针对 M1 接受，M1 的范围与
+待验证门禁见 [M1 里程碑说明](18-milestone-m1.md)，当前状态为 `In progress`。
+进入其他完整产品模块开发前，仍需把受影响的产品设计和 ADR 评审为 `Accepted`；
+任何里程碑的存在都不表示未来 UI、AI、真实 codec 或完整颜色管理方案已经冻结。
 
 ## 3. 决策优先级
 
@@ -41,11 +49,11 @@
 
 ### 客户端与平台工程
 
-`02 → 03 → 07 → 08 → 09 → 17 → 12 → 15`
+`02 → 03 → 07 → 08 → 09 → 17 → 18 → 12 → 15`
 
 ### 项目管理
 
-`01 → 02 → 11 → 13 → 17 → 15 → 16`
+`01 → 02 → 11 → 13 → 17 → 18 → 15 → 16`
 
 ### M0 实现与审查
 
@@ -56,6 +64,19 @@
 - [M0 命令契约](../specs/commands/README.md) 定义当前可执行命令子集；
 - [`nps.project/v1` 项目格式](../specs/project-format/nps.project.v1.md) 定义当前磁盘格式、崩溃语义和隐私边界；
 - [M0 实现说明](17-milestone-m0.md) 记录已完成范围、非目标、自动化证据和已知限制。
+
+### M1 实现与审查
+
+`ADR-0001 → ADR-0004 → ADR-0005 → 08 → 11 → 18`
+
+其中：
+
+- [ADR-0005](adr/ADR-0005-explicit-color-pixel-contract.md) 冻结 M1 的 FP32 RGBA、
+  预乘 Alpha 与稳定颜色 ID 边界；
+- [M1 里程碑说明](18-milestone-m1.md) 定义不可变 Edit DAG、参考算子、Mask16、
+  ROI/512 tile、取消/过期、`v1 → v2` 迁移和原子 PPM 参考导出的计划与完成门禁；
+- M1 的 Windows 本地门禁已通过但仍为 `In progress`；文档中的计划和工作流文件
+  不能替代首次推送后的三平台 CI、sanitizer、CodeQL 与分支保护证据。
 
 ## 5. 需求可追踪规则
 

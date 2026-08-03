@@ -42,7 +42,10 @@ CommandExecutionResult CommandBus::execute(
       .expected_revision =
           static_cast<std::int64_t>(command.expected_revision),
       .mutation = StoreMutation::adjust_exposure,
-      .exposure_delta_ev = 0.0};
+      .exposure_delta_ev = 0.0,
+      .edit_graph_json = {},
+      .edit_graph_sha256 = {},
+      .working_color_id = {}};
 
   switch (command.kind) {
     case CommandKind::AdjustExposure:
@@ -56,6 +59,17 @@ CommandExecutionResult CommandBus::execute(
     case CommandKind::HistoryRedo:
       store_command.mutation = StoreMutation::redo;
       break;
+    case CommandKind::GraphReplace: {
+      const auto& parameters =
+          std::get<GraphReplaceParameters>(command.parameters);
+      store_command.mutation = StoreMutation::replace_graph;
+      store_command.edit_graph_json =
+          document::canonical_edit_graph_json(parameters.graph);
+      store_command.edit_graph_sha256 = parameters.graph_hash;
+      store_command.working_color_id =
+          parameters.graph.working_color_space();
+      break;
+    }
   }
 
   try {

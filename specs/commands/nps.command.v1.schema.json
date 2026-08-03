@@ -1,8 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:natural-photo-studio:schema:nps.command:v1",
-  "title": "Natural Photo Studio M0 command envelope",
-  "description": "Strict M0 subset of nps.command/v1. Every object rejects unknown properties.",
+  "title": "Natural Photo Studio command envelope",
+  "description": "Strict M0-compatible and M1 graph subset of nps.command/v1. Every object rejects unknown properties.",
+  "$comment": "The transport parser additionally rejects empty input, inputs above 4 MiB plus 64 KiB of envelope allowance, and more than 64 structural nesting levels before DOM parsing.",
   "oneOf": [
     {
       "$ref": "#/$defs/adjustExposureCommand"
@@ -12,6 +13,9 @@
     },
     {
       "$ref": "#/$defs/historyRedoCommand"
+    },
+    {
+      "$ref": "#/$defs/graphReplaceCommand"
     }
   ],
   "$defs": {
@@ -71,6 +75,23 @@
     "historyParams": {
       "type": "object",
       "properties": {},
+      "additionalProperties": false
+    },
+    "graphReplaceParams": {
+      "type": "object",
+      "required": [
+        "graph",
+        "graphHash"
+      ],
+      "properties": {
+        "graph": {
+          "$ref": "urn:natural-photo-studio:schema:nps.edit-graph:v1"
+        },
+        "graphHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
       "additionalProperties": false
     },
     "adjustExposureCommand": {
@@ -186,6 +207,46 @@
         },
         "params": {
           "$ref": "#/$defs/historyParams"
+        },
+        "privacy": {
+          "$ref": "#/$defs/privacy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "graphReplaceCommand": {
+      "type": "object",
+      "required": [
+        "schema",
+        "commandId",
+        "idempotencyKey",
+        "documentId",
+        "expectedRevision",
+        "kind",
+        "params",
+        "privacy"
+      ],
+      "properties": {
+        "schema": {
+          "const": "nps.command/v1"
+        },
+        "commandId": {
+          "$ref": "#/$defs/commandId"
+        },
+        "idempotencyKey": {
+          "$ref": "#/$defs/idempotencyKey"
+        },
+        "documentId": {
+          "$ref": "#/$defs/documentId"
+        },
+        "expectedRevision": {
+          "$ref": "#/$defs/expectedRevision"
+        },
+        "kind": {
+          "const": "graph.replace"
+        },
+        "params": {
+          "$ref": "#/$defs/graphReplaceParams"
         },
         "privacy": {
           "$ref": "#/$defs/privacy"

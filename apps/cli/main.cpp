@@ -11,12 +11,15 @@
 
 #include <nlohmann/json.hpp>
 
+#include "nps/color/color_encoding.hpp"
 #include "nps/core/command.hpp"
 #include "nps/core/command_bus.hpp"
 #include "nps/core/project_store.hpp"
 #include "nps/imaging/operations.hpp"
 #include "nps/imaging/ppm16.hpp"
 #include "nps/imaging/synthetic.hpp"
+#include "nps/render/atomic_ppm_export.hpp"
+#include "nps/render/cpu_renderer.hpp"
 
 namespace {
 
@@ -30,6 +33,7 @@ using nps::core::FaultPoint;
 using nps::core::ProjectStore;
 using nps::core::ProjectStoreError;
 using nps::imaging::Image16;
+using nps::imaging::ImageF32;
 
 [[nodiscard]] std::span<const std::uint8_t> as_unsigned_bytes(
     const std::vector<std::byte>& bytes) {
@@ -196,6 +200,160 @@ int run_crash_create_after_object(
   throw std::runtime_error("The create crash fault point was not reached.");
 }
 
+[[nodiscard]] nps::color::OpaqueImage16Options
+reference_export_options() {
+  return {
+      .destination_encoding =
+          nps::color::ColorEncoding::scene_linear_rec2020_d65,
+      .matte_rgb = {0.0F, 0.0F, 0.0F}};
+}
+
+[[nodiscard]] std::filesystem::path absolute_project_root(
+    const std::filesystem::path& project_path) {
+  std::error_code error;
+  const auto absolute = std::filesystem::absolute(project_path, error);
+  if (error || absolute.empty()) {
+    throw ProjectStoreError(
+        "IO_PROJECT_PATH",
+        "The project path could not be normalized.");
+  }
+  return absolute.lexically_normal();
+}
+
+[[nodiscard]] std::vector<std::filesystem::path>
+protected_project_paths(
+    const std::filesystem::path& project_root,
+    const nps::core::Snapshot& snapshot) {
+  if (snapshot.source_hash.size() != 64U) {
+    throw ProjectStoreError(
+        "IO_PROJECT_FORMAT",
+        "The current snapshot source hash is invalid.");
+  }
+
+  const auto database = project_root / "project.db";
+  const auto objects = project_root / "objects";
+  const auto source_object =
+      objects / "sha256" / snapshot.source_hash.substr(0, 2) /
+      snapshot.source_hash.substr(2);
+  return {
+      project_root,
+      database,
+      objects,
+      source_object,
+  };
+}
+
+int run_project_export(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& destination,
+    nps::render::ExistingFilePolicy existing_file_policy,
+    nps::render::AtomicPpmExportFaultPoint fault_point =
+        nps::render::AtomicPpmExportFaultPoint::none) {
+  ProjectStore project = ProjectStore::open(project_path);
+  if (project.project_format() != "nps.project/v2") {
+    throw ProjectStoreError(
+        "IO_PROJECT_MIGRATION_REQUIRED",
+        "Reference export requires an explicitly migrated v2 project.");
+  }
+  static_cast<void>(project.verify_integrity());
+
+  const auto snapshot = project.current_snapshot();
+  auto parsed_graph =
+      nps::document::parse_edit_graph_json(snapshot.edit_graph_json);
+  if (const auto* error =
+          std::get_if<nps::document::EditGraphError>(&parsed_graph)) {
+    throw ProjectStoreError(
+        "IO_PROJECT_FORMAT",
+        std::string("The current edit graph is invalid: ") +
+            std::string(nps::document::to_string(error->code)));
+  }
+  const auto graph =
+      std::get<nps::document::EditGraph>(std::move(parsed_graph));
+
+  const auto source_bytes = project.read_source_bytes();
+  const Image16 source_image16 =
+      nps::imaging::decode_ppm16(as_bytes(source_bytes));
+  constexpr auto encoding =
+      nps::color::ColorEncoding::scene_linear_rec2020_d65;
+  const ImageF32 source_image = nps::color::image16_to_opaque_f32(
+      source_image16, encoding, encoding);
+  const std::int64_t revision = project.current_revision();
+  const std::string snapshot_id =
+      "snapshot-" + std::to_string(snapshot.id);
+  const nps::render::RenderRequest request{
+      .document_id = project.document_id(),
+      .snapshot_id = snapshot_id,
+      .revision = revision,
+      .source_hash = nps::imaging::image_f32_sha256(source_image),
+      .generation = 1U,
+      .roi =
+          {
+              .x = 0U,
+              .y = 0U,
+              .width = source_image.width,
+              .height = source_image.height,
+          },
+      .quality = nps::render::RenderQuality::final,
+      .tile_size = 512U,
+      .worker_count = 1U,
+  };
+  const auto rendered = nps::render::CpuRenderer{}.render(
+      source_image,
+      graph,
+      std::span<const nps::render::MaskAssetView>{},
+      request);
+
+  const nps::render::AtomicPpmExportIdentity identity{
+      .document_id = project.document_id(),
+      .snapshot_id = snapshot_id,
+      .revision = revision,
+      .source_hash = snapshot.source_hash,
+      .graph_hash = snapshot.edit_graph_sha256,
+      .color_id = snapshot.working_color_id,
+  };
+  const auto forbidden =
+      protected_project_paths(absolute_project_root(project_path), snapshot);
+  nps::render::export_atomic_ppm16(
+      rendered.image,
+      identity,
+      destination,
+      reference_export_options(),
+      forbidden,
+      existing_file_policy,
+      {},
+      fault_point);
+  std::cout
+      << nlohmann::json{
+             {"status", "exported"},
+             {"format", "P6-PPM-16BE"},
+             {"width", rendered.image.width},
+             {"height", rendered.image.height},
+             {"colorSpace",
+              nps::color::scene_linear_rec2020_d65_id}}
+             .dump(2)
+      << '\n';
+  return 0;
+}
+
+int run_export_demo(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& destination) {
+  return run_project_export(
+      project_path,
+      destination,
+      nps::render::ExistingFilePolicy::refuse_existing);
+}
+
+int run_crash_export_after_flush(
+    const std::filesystem::path& project_path,
+    const std::filesystem::path& destination) {
+  return run_project_export(
+      project_path,
+      destination,
+      nps::render::ExistingFilePolicy::refuse_existing,
+      nps::render::AtomicPpmExportFaultPoint::hard_exit_after_flush);
+}
+
 int run_verify_recovery(const std::filesystem::path& project_path) {
   ProjectStore project = ProjectStore::open(project_path);
   const auto integrity = project.verify_integrity();
@@ -229,6 +387,25 @@ int run_verify_recovery(const std::filesystem::path& project_path) {
   return 0;
 }
 
+int run_migrate(
+    const std::filesystem::path& source_path,
+    const std::filesystem::path& target_path,
+    FaultPoint fault_point = FaultPoint::none) {
+  ProjectStore migrated = ProjectStore::migrate_v1_to_v2(
+      source_path, target_path, fault_point);
+  const auto integrity = migrated.verify_integrity();
+  std::cout
+      << nlohmann::json{
+             {"status", "migrated"},
+             {"projectFormat", migrated.project_format()},
+             {"documentId", migrated.document_id()},
+             {"revision", integrity.revision},
+             {"snapshotId", migrated.current_snapshot().id}}
+             .dump(2)
+      << '\n';
+  return 0;
+}
+
 void print_usage() {
   std::cerr
       << "Usage:\n"
@@ -236,19 +413,52 @@ void print_usage() {
       << "  nps-cli verify <project.npsproj>\n"
       << "  nps-cli crash-create-after-object <project.npsproj>\n"
       << "  nps-cli crash-commit <project.npsproj>\n"
-      << "  nps-cli verify-recovery <project.npsproj>\n";
+      << "  nps-cli verify-recovery <project.npsproj>\n"
+      << "  nps-cli export-demo <v2-project.npsproj> <output.ppm>\n"
+      << "  nps-cli crash-export-after-flush "
+         "<v2-project.npsproj> <output.ppm>\n"
+      << "  nps-cli migrate-v1-v2 <source.npsproj> <target.npsproj>\n"
+      << "  nps-cli crash-migrate-staged <source.npsproj> <target.npsproj>\n"
+      << "  nps-cli crash-migrate-published <source.npsproj> <target.npsproj>\n";
 }
 
 }  // namespace
 
 int main(int argument_count, char** arguments) {
-  if (argument_count != 3) {
+  if (argument_count != 3 && argument_count != 4) {
     print_usage();
     return 64;
   }
 
   try {
     const std::string_view operation(arguments[1]);
+    if (argument_count == 4) {
+      const std::filesystem::path source_path(arguments[2]);
+      const std::filesystem::path target_path(arguments[3]);
+      if (operation == "export-demo") {
+        return run_export_demo(source_path, target_path);
+      }
+      if (operation == "crash-export-after-flush") {
+        return run_crash_export_after_flush(source_path, target_path);
+      }
+      if (operation == "migrate-v1-v2") {
+        return run_migrate(source_path, target_path);
+      }
+      if (operation == "crash-migrate-staged") {
+        return run_migrate(
+            source_path,
+            target_path,
+            FaultPoint::after_migration_staged);
+      }
+      if (operation == "crash-migrate-published") {
+        return run_migrate(
+            source_path,
+            target_path,
+            FaultPoint::after_migration_published);
+      }
+      print_usage();
+      return 64;
+    }
     const std::filesystem::path project_path(arguments[2]);
     if (operation == "demo") {
       return run_demo(project_path);
@@ -277,6 +487,30 @@ int main(int argument_count, char** arguments) {
                .dump()
         << '\n';
     return 2;
+  } catch (const nps::render::AtomicPpmExportError& error) {
+    std::cerr
+        << nlohmann::json{
+               {"status", "failed"},
+               {"code",
+                std::string("EXPORT_") +
+                    std::string(nps::render::to_string(error.code()))},
+               {"message", error.what()},
+               {"projectModified", false}}
+               .dump()
+        << '\n';
+    return 3;
+  } catch (const nps::render::RenderError& error) {
+    std::cerr
+        << nlohmann::json{
+               {"status", "failed"},
+               {"code",
+                std::string("RENDER_") +
+                    std::string(nps::render::to_string(error.code()))},
+               {"message", error.what()},
+               {"projectModified", false}}
+               .dump()
+        << '\n';
+    return 4;
   } catch (const std::exception& error) {
     std::cerr
         << nlohmann::json{

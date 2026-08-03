@@ -11,9 +11,7 @@ on:
     - cron: "23 4 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  security-events: write
+permissions: {}
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}
@@ -28,20 +26,17 @@ env:
 jobs:
   analyze:
     name: Analyze C/C++
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
-        with:
-          languages: c-cpp
-          build-mode: manual
 
       - name: Fetch pinned vcpkg
         shell: bash
@@ -51,15 +46,35 @@ jobs:
             https://github.com/microsoft/vcpkg.git .tools/vcpkg
           git -C .tools/vcpkg fetch --depth 1 origin "$VCPKG_COMMIT"
           git -C .tools/vcpkg checkout --detach "$VCPKG_COMMIT"
+          actual_commit="$(git -C .tools/vcpkg rev-parse --verify HEAD)"
+          test "$actual_commit" = "$VCPKG_COMMIT"
 
       - name: Bootstrap vcpkg
         shell: bash
         run: ./.tools/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
+      # CodeQL manual mode traces every C/C++ compilation after initialization.
+      # Install third-party sources first so alerts remain scoped to this repo.
+      - name: Preinstall pinned dependencies outside CodeQL extraction
+        shell: bash
+        run: |
+          ./.tools/vcpkg/vcpkg install \
+            --x-manifest-root="$GITHUB_WORKSPACE" \
+            --triplet x64-linux \
+            --clean-after-build
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
       - name: Configure and build
         shell: bash
         run: |
-          cmake --preset dev
+          cmake --preset dev \
+            -DVCPKG_MANIFEST_INSTALL=OFF \
+            -DVCPKG_INSTALLED_DIR="$GITHUB_WORKSPACE/vcpkg_installed"
           cmake --build --preset dev
 
       - name: Analyze

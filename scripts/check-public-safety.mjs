@@ -438,6 +438,134 @@ function findActionPinViolations(text) {
   return violations;
 }
 
+function findWorkflowSecurityViolations(text) {
+  const violations = [];
+  const lines = text.split(/\r?\n/u);
+  let hasExplicitTopLevelPermissions = false;
+
+  for (const [index, line] of lines.entries()) {
+    if (/^\s*#/u.test(line)) {
+      continue;
+    }
+
+    const code = line.replace(/\s+#.*$/u, "");
+    if (/^permissions\s*:/u.test(code)) {
+      hasExplicitTopLevelPermissions = true;
+    }
+
+    const unsafeDefinitions = [
+      {
+        pattern:
+          /^\s{0,4}(?:"pull_request_target"|'pull_request_target'|pull_request_target)\s*:/u,
+        rule: "workflow.privileged-pr-trigger",
+        message:
+          "pull_request_target is not allowed for this public repository",
+      },
+      {
+        pattern: /^\s*permissions\s*:\s*(?:write-all|read-all)\s*$/u,
+        rule: "workflow.broad-permissions",
+        message:
+          "workflow permissions must enumerate only the scopes each job needs",
+      },
+      {
+        pattern: /^\s*secrets\s*:\s*inherit\s*$/u,
+        rule: "workflow.inherited-secrets",
+        message: "reusable workflows must not inherit every caller secret",
+      },
+      {
+        pattern: /^\s*persist-credentials\s*:\s*true\s*$/u,
+        rule: "workflow.persisted-checkout-credentials",
+        message: "checkout credentials must not persist after the checkout step",
+      },
+      {
+        pattern: /^\s*runs-on\s*:.*\bself-hosted\b/iu,
+        rule: "workflow.self-hosted-runner",
+        message:
+          "public-repository workflows must not execute untrusted changes on self-hosted runners",
+      },
+    ];
+
+    for (const definition of unsafeDefinitions) {
+      if (definition.pattern.test(code)) {
+        violations.push({
+          rule: definition.rule,
+          line: index + 1,
+          message: definition.message,
+        });
+      }
+    }
+
+    const containerMatch = code.match(
+      /^\s*(?:container|image)\s*:\s*["']?([^"'#\s]+)["']?\s*$/u,
+    );
+    if (
+      containerMatch &&
+      !/@sha256:[0-9a-f]{64}$/iu.test(containerMatch[1])
+    ) {
+      violations.push({
+        rule: "supply-chain.container-not-pinned",
+        line: index + 1,
+        message: "workflow container images must use an immutable digest",
+      });
+    }
+  }
+
+  if (!hasExplicitTopLevelPermissions) {
+    violations.push({
+      rule: "workflow.permissions-missing",
+      line: 1,
+      message:
+        "workflow must declare explicit top-level GitHub token permissions",
+    });
+  }
+
+  for (const [index, line] of lines.entries()) {
+    if (!/\buses\s*:\s*actions\/checkout@[0-9a-f]{40}\b/iu.test(line)) {
+      continue;
+    }
+
+    const usesIndent = line.match(/^\s*/u)[0].length;
+    const checkoutBlock = [line];
+    for (
+      let blockIndex = index + 1;
+      blockIndex < lines.length;
+      blockIndex += 1
+    ) {
+      const candidate = lines[blockIndex];
+      if (!candidate.trim() || /^\s*#/u.test(candidate)) {
+        checkoutBlock.push(candidate);
+        continue;
+      }
+
+      const candidateIndent = candidate.match(/^\s*/u)[0].length;
+      if (
+        candidateIndent < usesIndent ||
+        (candidateIndent <= usesIndent && /^\s*-\s/u.test(candidate))
+      ) {
+        break;
+      }
+      checkoutBlock.push(candidate);
+    }
+
+    if (
+      !checkoutBlock.some((candidate) =>
+        /^\s*persist-credentials\s*:\s*(?:false|"false"|'false')\s*(?:#.*)?$/u.test(
+          candidate,
+        ),
+      )
+    ) {
+      violations.push({
+        rule: "workflow.checkout-credentials-not-disabled",
+        line: index + 1,
+        message:
+          "actions/checkout must set persist-credentials to false explicitly",
+      });
+    }
+  }
+
+  return violations;
+}
+
 function isActionConfiguration(relativePath) {
   const lower = relativePath.toLowerCase();
   const isYaml = lower.endsWith(".yml") || lower.endsWith(".yaml");
@@ -447,6 +575,14 @@ function isActionConfiguration(relativePath) {
       lower.startsWith(".github/actions/") ||
       lower === "action.yml" ||
       lower === "action.yaml")
+  );
+}
+
+function isWorkflowConfiguration(relativePath) {
+  const lower = relativePath.toLowerCase();
+  return (
+    (lower.endsWith(".yml") || lower.endsWith(".yaml")) &&
+    lower.startsWith(".github/workflows/")
   );
 }
 
@@ -712,6 +848,9 @@ export async function scanRepository(
       ...findAbsoluteUserPathViolations(text),
       ...(isActionConfiguration(entry.relativePath)
         ? findActionPinViolations(text)
+        : []),
+      ...(isWorkflowConfiguration(entry.relativePath)
+        ? findWorkflowSecurityViolations(text)
         : []),
     ];
 

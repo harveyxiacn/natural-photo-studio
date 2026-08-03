@@ -4,14 +4,49 @@
 #include <array>
 #include <cmath>
 #include <initializer_list>
+#include <ranges>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace nps::core {
 namespace {
 
 using Json = nlohmann::json;
+
+[[nodiscard]] bool json_nesting_is_bounded(
+    std::string_view json_text,
+    std::size_t maximum_depth) noexcept {
+    std::size_t depth = 0U;
+    bool inside_string = false;
+    bool escaped = false;
+    for (const char character : json_text) {
+        if (inside_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (character == '\\') {
+                escaped = true;
+            } else if (character == '"') {
+                inside_string = false;
+            }
+            continue;
+        }
+        if (character == '"') {
+            inside_string = true;
+        } else if (character == '{' || character == '[') {
+            ++depth;
+            if (depth > maximum_depth) {
+                return false;
+            }
+        } else if (
+            (character == '}' || character == ']') && depth > 0U) {
+            --depth;
+        }
+    }
+    return true;
+}
 
 [[nodiscard]] CommandError make_error(
     CommandErrorCode code,
@@ -95,8 +130,8 @@ using Json = nlohmann::json;
         static_cast<void>(ignored);
         if (!is_expected_key(actual_key, required)) {
             return schema_error(
-                std::string(object_name) + " contains unsupported property '" +
-                actual_key + "'.");
+                std::string(object_name) +
+                " contains an unsupported property.");
         }
     }
 
@@ -116,11 +151,56 @@ using Json = nlohmann::json;
     return ev == 0.0 ? 0.0 : ev;
 }
 
+[[nodiscard]] bool is_lowercase_sha256(std::string_view value) noexcept {
+    return value.size() == 64U &&
+           std::ranges::all_of(
+               value,
+               [](char character) {
+                   return (character >= '0' && character <= '9') ||
+                          (character >= 'a' && character <= 'f');
+               });
+}
+
+[[nodiscard]] std::optional<CommandError>
+validate_graph_replace_parameters(
+    const GraphReplaceParameters& parameters) {
+    if (!is_lowercase_sha256(parameters.graph_hash)) {
+        return schema_error(
+            "params.graphHash must be exactly 64 lowercase hexadecimal "
+            "SHA-256 characters.");
+    }
+
+    try {
+        const std::string canonical_graph =
+            document::canonical_edit_graph_json(parameters.graph);
+        document::EditGraphResult reparsed =
+            document::parse_edit_graph_json(canonical_graph);
+        if (!std::holds_alternative<document::EditGraph>(reparsed)) {
+            return schema_error(
+                "params.graph must be a valid strict "
+                "nps.edit-graph/v1 object.");
+        }
+
+        const document::EditGraph& normalized_graph =
+            std::get<document::EditGraph>(reparsed);
+        if (document::edit_graph_sha256(normalized_graph) !=
+            parameters.graph_hash) {
+            return schema_error(
+                "params.graphHash does not match the canonical edit graph.");
+        }
+    } catch (const std::exception&) {
+        return schema_error(
+            "params.graph could not be validated or content-addressed.");
+    }
+
+    return std::nullopt;
+}
+
 [[nodiscard]] Json privacy_to_json(const CommandPrivacy& privacy) {
     if (privacy.network != DataAccessPolicy::Deny ||
         privacy.cloud_inference != DataAccessPolicy::Deny) {
         throw std::invalid_argument(
-            "M0 commands require network and cloud inference to be denied.");
+            "Commands require network and cloud inference to be denied.");
     }
 
     return Json{
@@ -148,6 +228,18 @@ using Json = nlohmann::json;
                     "history commands require HistoryParameters.");
             }
             return Json::object();
+        case CommandKind::GraphReplace: {
+            const auto* parameters =
+                std::get_if<GraphReplaceParameters>(&command.parameters);
+            if (parameters == nullptr) {
+                throw std::invalid_argument(
+                    "graph.replace requires GraphReplaceParameters.");
+            }
+            return Json{
+                {"graph", document::edit_graph_to_json(parameters->graph)},
+                {"graphHash", parameters->graph_hash},
+            };
+        }
     }
 
     throw std::invalid_argument("The command kind is not registered.");
@@ -163,6 +255,8 @@ std::string_view to_string(CommandKind kind) noexcept {
             return "history.undo";
         case CommandKind::HistoryRedo:
             return "history.redo";
+        case CommandKind::GraphReplace:
+            return "graph.replace";
     }
     return "<invalid-command-kind>";
 }
@@ -177,6 +271,9 @@ std::optional<CommandKind> command_kind_from_string(
     }
     if (value == "history.redo") {
         return CommandKind::HistoryRedo;
+    }
+    if (value == "graph.replace") {
+        return CommandKind::GraphReplace;
     }
     return std::nullopt;
 }
@@ -216,7 +313,7 @@ std::optional<CommandError> validate_command(const Command& command) {
         command.privacy.cloud_inference != DataAccessPolicy::Deny) {
         return schema_error(
             "privacy.network and privacy.cloudInference must both be 'deny' "
-            "for M0.");
+            "for local execution.");
     }
 
     switch (command.kind) {
@@ -237,6 +334,16 @@ std::optional<CommandError> validate_command(const Command& command) {
                     "history.undo and history.redo require empty params.");
             }
             return std::nullopt;
+        case CommandKind::GraphReplace: {
+            const auto* parameters =
+                std::get_if<GraphReplaceParameters>(&command.parameters);
+            if (parameters == nullptr) {
+                return schema_error(
+                    "graph.replace requires exactly graph and graphHash "
+                    "parameters.");
+            }
+            return validate_graph_replace_parameters(*parameters);
+        }
     }
 
     return make_error(
@@ -245,12 +352,51 @@ std::optional<CommandError> validate_command(const Command& command) {
 }
 
 CommandParseResult parse_command_json(std::string_view json_text) {
+    if (json_text.empty() ||
+        json_text.size() > kMaximumCommandJsonBytes ||
+        !json_nesting_is_bounded(
+            json_text, kMaximumCommandJsonNestingDepth)) {
+        return schema_error(
+            "The command is not valid bounded JSON.");
+    }
+    bool duplicate_property = false;
+    std::vector<std::unordered_set<std::string>> object_keys;
+    const Json::parser_callback_t callback =
+        [&duplicate_property, &object_keys](
+            int,
+            Json::parse_event_t event,
+            Json& parsed) {
+            if (event == Json::parse_event_t::object_start) {
+                object_keys.emplace_back();
+            } else if (event == Json::parse_event_t::key) {
+                if (object_keys.empty() ||
+                    !object_keys.back()
+                         .insert(parsed.get_ref<const std::string&>())
+                         .second) {
+                    duplicate_property = true;
+                }
+            } else if (
+                event == Json::parse_event_t::object_end &&
+                !object_keys.empty()) {
+                object_keys.pop_back();
+            }
+            return true;
+        };
+
     Json root;
     try {
-        root = Json::parse(json_text.begin(), json_text.end());
-    } catch (const Json::exception& exception) {
+        root = Json::parse(
+            json_text.begin(),
+            json_text.end(),
+            callback,
+            true,
+            false);
+    } catch (const Json::exception&) {
+        return schema_error("The command is not valid bounded JSON.");
+    }
+    if (duplicate_property) {
         return schema_error(
-            "The command is not valid JSON: " + std::string(exception.what()));
+            "Duplicate JSON object properties are not allowed.");
     }
 
     constexpr std::array<std::string_view, 8> envelope_keys{
@@ -282,8 +428,7 @@ CommandParseResult parse_command_json(std::string_view json_text) {
             });
         if (expected_key == envelope_keys.end()) {
             return schema_error(
-                "The command envelope contains unsupported property '" + key +
-                "'.");
+                "The command envelope contains an unsupported property.");
         }
     }
 
@@ -354,7 +499,7 @@ CommandParseResult parse_command_json(std::string_view json_text) {
         return make_error(
             CommandErrorCode::CmdUnsupportedType,
             "The requested command kind is not registered. Choose "
-            "adjust.exposure, history.undo, or history.redo.");
+            "adjust.exposure, history.undo, history.redo, or graph.replace.");
     }
 
     const Json& parameters_json = root.at("params");
@@ -378,6 +523,38 @@ CommandParseResult parse_command_json(std::string_view json_text) {
             return *std::move(error);
         }
         parameters = AdjustExposureParameters{.ev = normalized_ev(ev)};
+    } else if (*kind == CommandKind::GraphReplace) {
+        if (auto error = require_exact_keys(
+                parameters_json,
+                {"graph", "graphHash"},
+                "params")) {
+            return *std::move(error);
+        }
+        if (!parameters_json.at("graph").is_object()) {
+            return schema_error(
+                "params.graph must be a JSON object.");
+        }
+        if (!parameters_json.at("graphHash").is_string()) {
+            return schema_error(
+                "params.graphHash must be a JSON string.");
+        }
+
+        document::EditGraphResult parsed_graph =
+            document::parse_edit_graph_json(
+                parameters_json.at("graph").dump());
+        if (!std::holds_alternative<document::EditGraph>(parsed_graph)) {
+            return schema_error(
+                "params.graph must be a valid strict "
+                "nps.edit-graph/v1 object.");
+        }
+
+        parameters = GraphReplaceParameters{
+            .graph =
+                std::get<document::EditGraph>(std::move(parsed_graph)),
+            .graph_hash =
+                parameters_json.at("graphHash")
+                    .get_ref<const std::string&>(),
+        };
     } else {
         if (auto error = require_exact_keys(parameters_json, {}, "params")) {
             return *std::move(error);

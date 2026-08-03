@@ -6,7 +6,7 @@ endif()
 
 project(
   natural_photo_studio
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "Local-first non-destructive professional photo editor"
   LANGUAGES CXX
 )
@@ -21,12 +21,16 @@ include(NpsWarnings)
 
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 add_library(
   nps_imaging
   STATIC
+    src/color/color_encoding.cpp
+    src/imaging/image_f32.cpp
     src/imaging/image16.cpp
+    src/imaging/mask16.cpp
     src/imaging/operations.cpp
     src/imaging/ppm16.cpp
     src/imaging/synthetic.cpp
@@ -38,7 +42,53 @@ target_include_directories(
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
 )
+target_link_libraries(nps_imaging PRIVATE OpenSSL::Crypto)
 nps_enable_warnings(nps_imaging)
+
+add_library(
+  nps_document
+  STATIC
+    src/document/edit_graph.cpp
+)
+add_library(nps::document ALIAS nps_document)
+target_compile_features(nps_document PUBLIC cxx_std_23)
+target_include_directories(
+  nps_document
+  PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(
+  nps_document
+  PUBLIC
+    nlohmann_json::nlohmann_json
+  PRIVATE
+    OpenSSL::Crypto
+)
+nps_enable_warnings(nps_document)
+
+add_library(
+  nps_render
+  STATIC
+    src/render/atomic_ppm_export.cpp
+    src/render/cpu_renderer.cpp
+)
+add_library(nps::render ALIAS nps_render)
+target_compile_features(nps_render PUBLIC cxx_std_23)
+target_include_directories(
+  nps_render
+  PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+)
+target_link_libraries(
+  nps_render
+  PUBLIC
+    nps::document
+    nps::imaging
+    Threads::Threads
+  PRIVATE
+    OpenSSL::Crypto
+)
+nps_enable_warnings(nps_render)
 
 add_library(
   nps_core
@@ -57,6 +107,7 @@ target_include_directories(
 target_link_libraries(
   nps_core
   PUBLIC
+    nps::document
     nlohmann_json::nlohmann_json
   PRIVATE
     OpenSSL::Crypto
@@ -67,7 +118,7 @@ nps_enable_warnings(nps_core)
 add_executable(nps_cli apps/cli/main.cpp)
 set_target_properties(nps_cli PROPERTIES OUTPUT_NAME "nps-cli")
 target_compile_features(nps_cli PRIVATE cxx_std_23)
-target_link_libraries(nps_cli PRIVATE nps::core nps::imaging)
+target_link_libraries(nps_cli PRIVATE nps::core nps::imaging nps::render)
 nps_enable_warnings(nps_cli)
 
 if(NPS_BUILD_TESTS)
@@ -77,9 +128,13 @@ if(NPS_BUILD_TESTS)
 
   add_executable(
     nps_tests
+      tests/atomic_ppm_export_test.cpp
       tests/command_bus_test.cpp
       tests/command_protocol_test.cpp
+      tests/cpu_renderer_test.cpp
+      tests/edit_graph_test.cpp
       tests/imaging_test.cpp
+      tests/pixel_contract_test.cpp
       tests/project_store_test.cpp
   )
   target_compile_features(nps_tests PRIVATE cxx_std_23)
@@ -87,13 +142,21 @@ if(NPS_BUILD_TESTS)
     nps_tests
     PRIVATE
       nps::core
+      nps::document
       nps::imaging
+      nps::render
       Catch2::Catch2WithMain
+      unofficial::sqlite3::sqlite3
   )
   nps_enable_warnings(nps_tests)
 
   include(Catch)
-  catch_discover_tests(nps_tests)
+  catch_discover_tests(
+    nps_tests
+    PROPERTIES
+      LABELS unit
+      TIMEOUT 30
+  )
 
   add_test(
     NAME nps.recovery.committed-transaction
@@ -106,8 +169,9 @@ if(NPS_BUILD_TESTS)
   set_tests_properties(
     nps.recovery.committed-transaction
     PROPERTIES
+      LABELS "process;recovery;migration;export"
       RUN_SERIAL TRUE
-      TIMEOUT 30
+      TIMEOUT 120
   )
 endif()
 

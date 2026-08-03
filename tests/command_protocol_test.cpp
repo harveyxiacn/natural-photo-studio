@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 
 #include <catch2/catch_test_macros.hpp>
@@ -15,8 +16,11 @@ using nps::core::Command;
 using nps::core::CommandError;
 using nps::core::CommandErrorCode;
 using nps::core::CommandKind;
+using nps::core::GraphReplaceParameters;
 using nps::core::HistoryParameters;
 using nps::core::parse_command_json;
+using nps::document::EditGraph;
+using nps::document::EditGraphError;
 using Json = nlohmann::json;
 
 [[nodiscard]] Json valid_exposure_command() {
@@ -40,6 +44,72 @@ using Json = nlohmann::json;
     Json command = valid_exposure_command();
     command["kind"] = std::move(kind);
     command["params"] = Json::object();
+    return command;
+}
+
+[[nodiscard]] Json edit_node(
+    std::string node_id,
+    std::string type,
+    Json inputs,
+    Json parameters) {
+    return Json{
+        {"nodeId", std::move(node_id)},
+        {"type", std::move(type)},
+        {"algorithmVersion", "1.0.0"},
+        {"enabled", true},
+        {"opacity", 1.0},
+        {"computeDomain", "scene-linear"},
+        {"inputs", std::move(inputs)},
+        {"parameters", std::move(parameters)},
+    };
+}
+
+[[nodiscard]] Json valid_edit_graph(
+    std::string graph_id = "graph-main") {
+    return Json{
+        {"schema", "nps.edit-graph/v1"},
+        {"graphId", std::move(graph_id)},
+        {"workingColorSpace",
+         "nps.color/scene-linear-rec2020-d65/v1"},
+        {"sourceNodeId", "node-source"},
+        {"outputNodeId", "node-output"},
+        {"nodes",
+         Json::array({
+             edit_node(
+                 "node-source",
+                 "source",
+                 Json::array(),
+                 Json::object()),
+             edit_node(
+                 "node-output",
+                 "output",
+                 Json::array({"node-source"}),
+                 Json::object()),
+         })},
+    };
+}
+
+[[nodiscard]] EditGraph parsed_edit_graph(const Json& graph_json) {
+    nps::document::EditGraphResult parsed =
+        nps::document::parse_edit_graph_json(graph_json.dump());
+    if (const auto* graph = std::get_if<EditGraph>(&parsed)) {
+        return *graph;
+    }
+    const EditGraphError& error = std::get<EditGraphError>(parsed);
+    throw std::logic_error(
+        "The synthetic command graph is invalid: " + error.message);
+}
+
+[[nodiscard]] Json valid_graph_replace_command(
+    std::string graph_id = "graph-main") {
+    Json graph = valid_edit_graph(std::move(graph_id));
+    const EditGraph normalized = parsed_edit_graph(graph);
+    Json command = valid_exposure_command();
+    command["kind"] = "graph.replace";
+    command["params"] = {
+        {"graph", std::move(graph)},
+        {"graphHash", nps::document::edit_graph_sha256(normalized)},
+    };
     return command;
 }
 
@@ -90,6 +160,90 @@ TEST_CASE("history commands require an empty parameter object") {
         Json input = valid_history_command("history.undo");
         input["params"]["steps"] = 1;
         const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        CHECK(
+            std::get<CommandError>(result).code ==
+            CommandErrorCode::CmdSchemaInvalid);
+    }
+}
+
+TEST_CASE("strict graph replacement parses normalizes and round trips") {
+    const Json input = valid_graph_replace_command();
+    const auto result = parse_command_json(input.dump());
+
+    REQUIRE(std::holds_alternative<Command>(result));
+    const Command& command = std::get<Command>(result);
+    CHECK(command.kind == CommandKind::GraphReplace);
+    REQUIRE(
+        std::holds_alternative<GraphReplaceParameters>(
+            command.parameters));
+    const GraphReplaceParameters& parameters =
+        std::get<GraphReplaceParameters>(command.parameters);
+    CHECK(
+        parameters.graph_hash ==
+        nps::document::edit_graph_sha256(parameters.graph));
+
+    const Json serialized = nps::core::command_to_json(command);
+    CHECK(serialized.at("params").at("graph") ==
+          nps::document::edit_graph_to_json(parameters.graph));
+    CHECK(serialized.at("params").at("graphHash") ==
+          parameters.graph_hash);
+
+    const auto reparsed = parse_command_json(serialized.dump());
+    REQUIRE(std::holds_alternative<Command>(reparsed));
+    CHECK(std::get<Command>(reparsed) == command);
+}
+
+TEST_CASE("graph replacement rejects invalid graphs hashes and fields") {
+    SECTION("unknown graph property") {
+        Json input = valid_graph_replace_command();
+        input["params"]["graph"]["previewCache"] = true;
+        const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        CHECK(
+            std::get<CommandError>(result).code ==
+            CommandErrorCode::CmdSchemaInvalid);
+    }
+
+    SECTION("uppercase hash") {
+        Json input = valid_graph_replace_command();
+        std::string hash =
+            input["params"]["graphHash"].get<std::string>();
+        hash.front() = 'A';
+        input["params"]["graphHash"] = std::move(hash);
+        const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        CHECK(
+            std::get<CommandError>(result).code ==
+            CommandErrorCode::CmdSchemaInvalid);
+    }
+
+    SECTION("canonical hash mismatch") {
+        Json input = valid_graph_replace_command();
+        input["params"]["graphHash"] = std::string(64U, '0');
+        const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        CHECK(
+            std::get<CommandError>(result).code ==
+            CommandErrorCode::CmdSchemaInvalid);
+    }
+
+    SECTION("unknown graph replace parameter") {
+        Json input = valid_graph_replace_command();
+        input["params"]["merge"] = true;
+        const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        CHECK(
+            std::get<CommandError>(result).code ==
+            CommandErrorCode::CmdSchemaInvalid);
+    }
+
+    SECTION("duplicate embedded graph property") {
+        std::string input = valid_graph_replace_command().dump();
+        const std::size_t position = input.find("\"graphId\"");
+        REQUIRE(position != std::string::npos);
+        input.insert(position, "\"graphId\":\"graph-other\",");
+        const auto result = parse_command_json(input);
         REQUIRE(std::holds_alternative<CommandError>(result));
         CHECK(
             std::get<CommandError>(result).code ==
@@ -166,6 +320,88 @@ TEST_CASE("schema and identifier grammar are strict") {
         CHECK(
             std::get<CommandError>(result).code ==
             CommandErrorCode::CmdSchemaInvalid);
+    }
+}
+
+TEST_CASE("command parsing is size depth and privacy bounded") {
+    SECTION("empty input") {
+        const auto result =
+            parse_command_json(std::string_view{});
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        CHECK(
+            std::get<CommandError>(result).code ==
+            CommandErrorCode::CmdSchemaInvalid);
+    }
+
+    SECTION("oversized input") {
+        const std::string input(
+            nps::core::kMaximumCommandJsonBytes + 1U, ' ');
+        const auto result = parse_command_json(input);
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        const CommandError& error = std::get<CommandError>(result);
+        CHECK(error.code == CommandErrorCode::CmdSchemaInvalid);
+        CHECK(error.message.find("bounded JSON") != std::string::npos);
+    }
+
+    SECTION("excessive structural nesting") {
+        std::string input(
+            nps::core::kMaximumCommandJsonNestingDepth + 1U, '[');
+        input += '0';
+        input.append(
+            nps::core::kMaximumCommandJsonNestingDepth + 1U, ']');
+        const auto result = parse_command_json(input);
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        const CommandError& error = std::get<CommandError>(result);
+        CHECK(error.code == CommandErrorCode::CmdSchemaInvalid);
+        CHECK(error.message.find("bounded JSON") != std::string::npos);
+    }
+
+    SECTION("malformed input is never echoed") {
+        const std::string private_marker = "private-subject-token";
+        const auto result = parse_command_json(
+            "{\"schema\":\"" + private_marker);
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        const CommandError& error = std::get<CommandError>(result);
+        CHECK(error.code == CommandErrorCode::CmdSchemaInvalid);
+        CHECK(
+            error.message.find(private_marker) ==
+            std::string::npos);
+    }
+
+    SECTION("unknown envelope property names are never echoed") {
+        const std::string private_marker =
+            "private-subject-token-envelope";
+        Json input = valid_exposure_command();
+        input[private_marker] = true;
+        const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        const CommandError& error = std::get<CommandError>(result);
+        CHECK(error.code == CommandErrorCode::CmdSchemaInvalid);
+        CHECK(error.message.find(private_marker) == std::string::npos);
+    }
+
+    SECTION("unknown params property names are never echoed") {
+        const std::string private_marker =
+            "private-subject-token-params";
+        Json input = valid_exposure_command();
+        input["params"][private_marker] = true;
+        const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        const CommandError& error = std::get<CommandError>(result);
+        CHECK(error.code == CommandErrorCode::CmdSchemaInvalid);
+        CHECK(error.message.find(private_marker) == std::string::npos);
+    }
+
+    SECTION("unknown privacy property names are never echoed") {
+        const std::string private_marker =
+            "private-subject-token-privacy";
+        Json input = valid_exposure_command();
+        input["privacy"][private_marker] = "deny";
+        const auto result = parse_command_json(input.dump());
+        REQUIRE(std::holds_alternative<CommandError>(result));
+        const CommandError& error = std::get<CommandError>(result);
+        CHECK(error.code == CommandErrorCode::CmdSchemaInvalid);
+        CHECK(error.message.find(private_marker) == std::string::npos);
     }
 }
 
@@ -288,6 +524,53 @@ TEST_CASE("canonical idempotency payload excludes transport identifiers") {
     CHECK_FALSE(nps::core::has_same_idempotent_payload(first, retry));
 }
 
+TEST_CASE("graph replacement idempotency includes canonical graph and hash") {
+    const auto parsed =
+        parse_command_json(valid_graph_replace_command().dump());
+    REQUIRE(std::holds_alternative<Command>(parsed));
+    const Command first = std::get<Command>(parsed);
+
+    Command retry = first;
+    retry.command_id = "cmd-graph-transport-retry";
+    retry.idempotency_key = "another-graph-lookup-key";
+    CHECK(nps::core::has_same_idempotent_payload(first, retry));
+
+    Json reordered_input = valid_graph_replace_command();
+    Json& reordered_nodes =
+        reordered_input["params"]["graph"]["nodes"];
+    reordered_nodes = Json::array({
+        reordered_nodes.at(1),
+        reordered_nodes.at(0),
+    });
+    const auto reordered_parsed =
+        parse_command_json(reordered_input.dump());
+    REQUIRE(std::holds_alternative<Command>(reordered_parsed));
+    Command reordered = std::get<Command>(reordered_parsed);
+    reordered.command_id = first.command_id;
+    reordered.idempotency_key = first.idempotency_key;
+    CHECK(nps::core::has_same_idempotent_payload(first, reordered));
+
+    const Json payload =
+        Json::parse(nps::core::canonical_idempotency_payload(first));
+    const auto& first_parameters =
+        std::get<GraphReplaceParameters>(first.parameters);
+    CHECK(
+        payload.at("params").at("graph") ==
+        nps::document::edit_graph_to_json(first_parameters.graph));
+    CHECK(
+        payload.at("params").at("graphHash") ==
+        first_parameters.graph_hash);
+
+    const auto changed_parsed =
+        parse_command_json(
+            valid_graph_replace_command("graph-changed").dump());
+    REQUIRE(std::holds_alternative<Command>(changed_parsed));
+    Command changed = std::get<Command>(changed_parsed);
+    changed.command_id = first.command_id;
+    changed.idempotency_key = first.idempotency_key;
+    CHECK_FALSE(nps::core::has_same_idempotent_payload(first, changed));
+}
+
 TEST_CASE("transaction-layer errors have stable codes and recovery context") {
     const CommandError reused =
         nps::core::make_idempotency_reuse_error("desktop-session:001");
@@ -321,4 +604,36 @@ TEST_CASE("programmatically constructed commands are validated") {
     CHECK(validation_error->code == CommandErrorCode::CmdSchemaInvalid);
     CHECK_THROWS_AS(
         nps::core::command_to_json(invalid), std::invalid_argument);
+
+    SECTION("graph hash must match the canonical C++ graph") {
+        const EditGraph graph = parsed_edit_graph(valid_edit_graph());
+        Command graph_command{
+            .command_id = "cmd-graph",
+            .idempotency_key = "desktop-session:graph",
+            .document_id = "doc-001",
+            .expected_revision = 7,
+            .kind = CommandKind::GraphReplace,
+            .parameters = GraphReplaceParameters{
+                .graph = graph,
+                .graph_hash =
+                    nps::document::edit_graph_sha256(graph),
+            },
+            .privacy = {},
+        };
+
+        CHECK_FALSE(
+            nps::core::validate_command(graph_command).has_value());
+
+        std::get<GraphReplaceParameters>(
+            graph_command.parameters).graph_hash = std::string(64U, 'f');
+        const auto graph_error =
+            nps::core::validate_command(graph_command);
+        REQUIRE(graph_error.has_value());
+        CHECK(
+            graph_error->code ==
+            CommandErrorCode::CmdSchemaInvalid);
+        CHECK_THROWS_AS(
+            nps::core::canonical_idempotency_payload(graph_command),
+            std::invalid_argument);
+    }
 }

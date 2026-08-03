@@ -73,8 +73,8 @@ example.npsproj/
 - SQLite `user_version = 1`；
 - `meta.format = "nps.project/v1"`。
 
-任一值缺失或不匹配时，M0 拒绝打开。当前没有从其他版本迁移到 v1 的实现，也没有
-“尽力猜测”未知主版本的兼容模式。
+任一值缺失或不匹配时，M0 拒绝打开。M1 新增从 v1 到 v2 的显式 side-by-side
+迁移器，但普通打开 v1 不会隐式迁移；也没有“尽力猜测”未知主版本的兼容模式。
 
 创建时还会生成 `meta.document_id`。当前形式为 `doc-` 加 32 个小写十六进制字符；
 调用方必须把它当作不透明、项目内稳定的标识，而不是用户身份。
@@ -128,6 +128,10 @@ journal_mode = WAL
 synchronous = FULL
 temp_store = MEMORY
 trusted_schema = OFF
+legacy_alter_table = OFF
+writable_schema = OFF
+ignore_check_constraints = OFF
+recursive_triggers = OFF
 ```
 
 数据库以读写方式打开，并在 SQLite 支持的平台上请求 `SQLITE_OPEN_NOFOLLOW`。WAL 是
@@ -138,6 +142,15 @@ trusted_schema = OFF
 在所有远程文件系统、故障存储设备、内核错误或突然断电组合下具有相同保证。
 
 ## 6. STRICT Schema 的逻辑含义
+
+数据库的物理 Schema 也是版本化项目真相。v1 只接受本节规定的六张表，以及 SQLite
+为这些规范约束自动生成的索引；`sqlite_schema` 中不得出现触发器、视图、额外表、
+用户创建索引或不同的建表 SQL。把同名列改成更弱约束、增加列，或使用“逻辑上近似”
+的 DDL 都不是兼容 v1。`meta` 也必须恰好包含下文六个键，不能借未知键扩展格式。
+
+实现必须在读取可变业务事实和执行任何 `meta` 写入前完成这项精确 Schema 检查。
+`trusted_schema = OFF` 等 PRAGMA 是纵深防御，不代替白名单检查；未知触发器即使看似
+无害也必须拒绝，不能在打开或迁移过程中执行。
 
 ### 6.1 `meta`
 
@@ -234,8 +247,11 @@ trusted_schema = OFF
 
 ## 8. 创建与发布
 
-创建要求目标 `.npsproj` 不存在，且其父目录是真实目录而非符号链接或 Windows
-reparse point。实现先在目标的同一父目录建立随机
+创建要求目标 `.npsproj` 不存在。Windows 要求其直接父目录不是 reparse point；
+POSIX 会先按文件系统语义解析已存在的父目录（包括 macOS 的 `/var → /private/var`
+这类系统别名），再拼回尚未解析的最终 `.npsproj` 文件名。这个顺序既保留
+`symlink/..` 的真实路径语义，又确保最终项目目录仍能通过 no-follow 状态检查拒绝
+符号链接。实现随后在解析所得目标的同一父目录建立随机
 `.nps-creating-<随机标识>/`：
 
 1. 写入 `.nps-creating` 标记和目录骨架；
@@ -262,10 +278,13 @@ reparse point。实现先在目标的同一父目录建立随机
 
 1. 拒绝非目录项目根、链接/reparse 项目根和链接/reparse 数据库；
 2. 获取 `project.lock` 的非阻塞跨进程排他租约；
-3. 打开 SQLite 并校验三个格式版本标识；
-4. 若上次 `clean_shutdown = 0`，先运行 SQLite 完整性和外键检查；
-5. 在事务中设置 `clean_shutdown = 0`；
-6. 对数据库、对象和历史运行完整的 M0 完整性检查；
+3. 打开 SQLite，先校验 `application_id`、`user_version`，再精确校验
+   `sqlite_schema` 和 `meta` 键集合；
+4. 读取格式与运行态元数据，并在不写数据库的情况下完成 SQLite、对象、快照、历史、
+   事务、幂等及内容哈希的完整检查；
+5. 仅在上述所有检查成功后，才在事务中设置 `clean_shutdown = 0`；此前的值只用于
+   判断是否从未干净关闭恢复；
+6. 保持写会话并向调用方返回已完整验证的项目；
 7. 如存在合法 `.nps-creating`，在上述校验成功后删除它。
 
 同一时刻只允许一个 M0 `ProjectStore` 写会话。这个锁只协调遵守该协议的本机进程，
@@ -330,9 +349,11 @@ M0 只接收 [严格命令契约](../commands/README.md) 中的三种命令。�
 自动修复。它不检查未使用的 `previews/`、`recovery/`、`manifests/` 内容，不验证像素
 审美正确性，也不证明文件没有恶意载荷。
 
-路径检查会拒绝已观察到的链接和 reparse point，并对 SQLite 与锁文件使用平台可用的
-no-follow 打开方式。但是部分对象路径仍采用“检查后再打开”的普通文件系统流程，
-存在同权限本地攻击者竞争改写的剩余风险；M0 项目读取不是安全沙箱边界。
+POSIX 接受已解析为真实目录的父路径别名，但不会解析最终 `.npsproj` 组件；Windows
+保持既有路径解析和 reparse 检查行为。最终项目根、`project.db` 和受保护对象路径会
+拒绝已观察到的链接/reparse point，并对 SQLite 与锁文件使用平台可用的 no-follow
+打开方式。但是部分路径仍采用“检查后再打开”的普通文件系统流程，存在同权限本地
+攻击者竞争改写的剩余风险；M0 项目读取不是安全沙箱边界。
 
 ## 13. 隐私与安全边界
 
@@ -364,8 +385,10 @@ M0 命令契约强制：
 
 ## 14. 兼容性与演进
 
-`nps.project/v1` 当前没有迁移器。任何影响下列内容的变化都需要新规范、兼容性测试，
-并按影响决定增加 `user_version` 或新的格式主版本：
+`nps.project/v1` 的磁盘含义保持冻结。M1 的显式迁移器把源 v1 只读保留，并在同一
+父目录原子发布独立 v2 目标；精确契约见
+[`nps.project/v2`](nps.project.v2.md)。任何影响下列内容的后续变化仍需要新规范、
+兼容性测试，并按影响决定增加 `user_version` 或新的格式主版本：
 
 - 表或不变量的语义；
 - 对象路径、哈希算法或媒体类型；
@@ -373,5 +396,5 @@ M0 命令契约强制：
 - 创建标记、锁或崩溃恢复边界；
 - 隐私边界或是否允许外链/网络资产。
 
-在迁移实现和历史项目语料库建立前，不应手工修改 `project.db`，也不应承诺任意
-`0.1.x` 之外的读写兼容性。
+不应手工修改 `project.db`。v1→v2 迁移只承诺规范中受测的 M0 子集；未知未来版本仍
+拒绝写入。
