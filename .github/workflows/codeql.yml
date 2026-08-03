@@ -38,12 +38,6 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
-        with:
-          languages: c-cpp
-          build-mode: manual
-
       - name: Fetch pinned vcpkg
         shell: bash
         run: |
@@ -59,10 +53,28 @@ jobs:
         shell: bash
         run: ./.tools/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
+      # CodeQL manual mode traces every C/C++ compilation after initialization.
+      # Install third-party sources first so alerts remain scoped to this repo.
+      - name: Preinstall pinned dependencies outside CodeQL extraction
+        shell: bash
+        run: |
+          ./.tools/vcpkg/vcpkg install \
+            --x-manifest-root="$GITHUB_WORKSPACE" \
+            --triplet x64-linux \
+            --clean-after-build
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
       - name: Configure and build
         shell: bash
         run: |
-          cmake --preset dev
+          cmake --preset dev \
+            -DVCPKG_MANIFEST_INSTALL=OFF \
+            -DVCPKG_INSTALLED_DIR="$GITHUB_WORKSPACE/vcpkg_installed"
           cmake --build --preset dev
 
       - name: Analyze

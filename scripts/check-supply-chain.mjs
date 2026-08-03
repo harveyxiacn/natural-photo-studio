@@ -172,6 +172,31 @@ async function main() {
     }
   }
 
+  const codeqlText = workflows.get(".github/workflows/codeql.yml");
+  const dependencyInstallIndex = codeqlText.indexOf(
+    "Preinstall pinned dependencies outside CodeQL extraction",
+  );
+  const codeqlInitializeIndex = codeqlText.indexOf("Initialize CodeQL");
+  const projectBuildIndex = codeqlText.indexOf("cmake --build --preset dev");
+  if (
+    dependencyInstallIndex < 0 ||
+    codeqlInitializeIndex < 0 ||
+    projectBuildIndex < 0 ||
+    dependencyInstallIndex >= codeqlInitializeIndex ||
+    codeqlInitializeIndex >= projectBuildIndex ||
+    !codeqlText.includes("--clean-after-build") ||
+    !codeqlText.includes("-DVCPKG_MANIFEST_INSTALL=OFF") ||
+    !codeqlText.includes(
+      '-DVCPKG_INSTALLED_DIR="$GITHUB_WORKSPACE/vcpkg_installed"',
+    )
+  ) {
+    addViolation(
+      violations,
+      ".github/workflows/codeql.yml",
+      "pinned dependencies must be installed and cleaned before CodeQL initialization, then reused without manifest installation for the project build",
+    );
+  }
+
   if (violations.length > 0) {
     console.error(
       `Supply-chain policy failed with ${violations.length} violation(s):`,
